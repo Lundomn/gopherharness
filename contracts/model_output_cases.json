@@ -1,0 +1,37 @@
+[
+  {
+    "name": "final",
+    "raw": "prefix <final>done</final> suffix",
+    "expected": {"kind": "final", "text": "done"}
+  },
+  {
+    "name": "json_tool",
+    "raw": "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}</tool>",
+    "expected": {"kind": "tools", "tools": [{"name": "read_file", "args": {"path": "README.md"}}]}
+  },
+  {
+    "name": "json_tool_list",
+    "raw": "<tool>[{\"name\":\"read_file\",\"args\":{\"path\":\"a.go\"}},{\"name\":\"search\",\"args\":{\"pattern\":\"TODO\"}}]</tool>",
+    "expected": {"kind": "tools", "tools": [{"name": "read_file", "args": {"path": "a.go"}}, {"name": "search", "args": {"pattern": "TODO"}}]}
+  },
+  {
+    "name": "xml_write",
+    "raw": "<tool name=\"write_file\" path=\"notes.txt\"><content>line one\nline two</content></tool>",
+    "expected": {"kind": "tools", "tools": [{"name": "write_file", "args": {"path": "notes.txt", "content": "line one\nline two"}}]}
+  },
+  {
+    "name": "multiple_blocks",
+    "raw": "<tool>{\"name\":\"todo_add\",\"args\":{\"text\":\"test\"}}</tool>\n<tool>{\"name\":\"todo_list\",\"args\":{}}</tool>",
+    "expected": {"kind": "tools", "tools": [{"name": "todo_add", "args": {"text": "test"}}, {"name": "todo_list", "args": {}}]}
+  },
+  {
+    "name": "malformed_tool",
+    "raw": "<tool>{bad json}</tool>",
+    "expected": {"kind": "retry", "text": "Your previous response could not be executed. Problem: tool payload must be valid JSON or supported XML. Return one or more valid <tool> calls, or one <final> answer."}
+  },
+  {
+    "name": "empty",
+    "raw": "  ",
+    "expected": {"kind": "retry", "text": "Your previous response could not be executed. Problem: empty response. Return one or more valid <tool> calls, or one <final> answer."}
+  }
+]

@@ -1,0 +1,24 @@
+provider = "deepseek"
+
+[providers.deepseek]
+protocol = "anthropic"
+api_key = ""
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-pro"
+
+[providers.openai]
+protocol = "openai"
+api_key = ""
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.4"
+
+[providers.anthropic]
+protocol = "anthropic"
+api_key = ""
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4-6"
+
+[sandbox]
+mode = "off"
+backend = "auto"
+workspace_write = true

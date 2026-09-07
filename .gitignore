@@ -1,0 +1,4 @@
+/bin/
+/.pico/
+/.pico.toml
+*.log
