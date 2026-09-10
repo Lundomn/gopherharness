@@ -1,4 +1,4 @@
-.PHONY: build test check contract install clean
+.PHONY: build test check contract benchmark install clean
 
 build:
 	mkdir -p bin
@@ -17,6 +17,9 @@ check:
 
 contract:
 	PICO_PYTHON_ROOT=/Users/ljy/Documents/pico /Users/ljy/Documents/pico/.venv/bin/python scripts/cross_language_contract.py --go-command "go run ./cmd/gopherharness-contract"
+
+benchmark:
+	go run ./cmd/gopherharness-eval --offline --benchmark benchmarks/benchmark.json --fixtures benchmarks --workspaces artifacts/go-workspaces --artifact artifacts/go-benchmark.json
 
 install:
 	go install ./cmd/gopherharness ./cmd/gopherharness-tui ./cmd/gopherharness-eval ./cmd/gopherharness-contract

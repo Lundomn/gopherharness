@@ -18,6 +18,7 @@ func main() {
 	workspaces := flag.String("workspaces", "artifacts/go-workspaces", "workspace output root")
 	artifact := flag.String("artifact", "artifacts/go-benchmark.json", "result artifact")
 	providerName := flag.String("provider", "", "provider profile")
+	offline := flag.Bool("offline", false, "use each task's deterministic fake model responses")
 	flag.Parse()
 	cwd, _ := os.Getwd()
 	cfg, err := config.Load(cwd, "")
@@ -27,13 +28,16 @@ func main() {
 	if *providerName != "" {
 		cfg.Provider = *providerName
 	}
-	p, err := cfg.Selected()
-	if err != nil {
-		die(err)
-	}
-	client, err := provider.New(p, 300)
-	if err != nil {
-		die(err)
+	var client provider.Client
+	if !*offline {
+		p, err := cfg.Selected()
+		if err != nil {
+			die(err)
+		}
+		client, err = provider.New(p, 300)
+		if err != nil {
+			die(err)
+		}
 	}
 	benchmarkPath, _ := filepath.Abs(*benchmark)
 	result, err := evaluation.Run(context.Background(), evaluation.Options{BenchmarkPath: benchmarkPath, FixtureRoot: *fixtures, WorkspaceRoot: *workspaces, ArtifactPath: *artifact, Config: cfg, Provider: client})

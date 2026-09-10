@@ -1,4 +1,5 @@
 /bin/
+/artifacts/
 /.pico/
 /.pico.toml
 *.log

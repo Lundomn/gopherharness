@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Lundomn/gopherharness/internal/config"
+	"github.com/Lundomn/gopherharness/internal/governance"
 	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/provider"
 	"github.com/Lundomn/gopherharness/internal/runtime"
@@ -29,6 +30,7 @@ type Task struct {
 	Category         string   `json:"category"`
 	AllowedTools     []string `json:"allowed_tools"`
 	StepBudget       int      `json:"step_budget"`
+	Responses        []string `json:"responses,omitempty"`
 }
 type Row struct {
 	ID               string `json:"id"`
@@ -93,6 +95,12 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 	src := filepath.Join(opts.FixtureRoot, task.FixtureRepo)
 	dst := filepath.Join(opts.WorkspaceRoot, task.ID, filepath.Base(task.FixtureRepo))
 	row.Workspace = dst
+	// Every task owns its workspace. Remove a previous run so stale artifacts
+	// cannot turn a failed task into a false positive on the next baseline run.
+	if err := os.RemoveAll(dst); err != nil {
+		row.FailureCategory = "workspace_reset_failed"
+		return row
+	}
 	if err := copyTree(src, dst); err != nil {
 		row.FailureCategory = "fixture_copy_failed"
 		return row
@@ -101,11 +109,20 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 	if steps <= 0 {
 		steps = 6
 	}
-	agent, err := runtime.New(runtime.Options{Root: dst, Config: opts.Config, Provider: opts.Provider, Approval: permission.Auto, MaxSteps: steps, AllowedTools: task.AllowedTools})
+	client := opts.Provider
+	if len(task.Responses) > 0 {
+		client = &provider.Fake{Responses: append([]string(nil), task.Responses...)}
+	}
+	if client == nil {
+		row.FailureCategory = "provider_missing"
+		return row
+	}
+	agent, err := runtime.New(runtime.Options{Root: dst, Config: opts.Config, Provider: client, Approval: permission.Auto, FinalReadiness: governance.Off, MaxSteps: steps, AllowedTools: task.AllowedTools, DisableAutoDream: true})
 	if err != nil {
 		row.FailureCategory = "agent_init_failed"
 		return row
 	}
+	defer agent.Close()
 	answer, askErr := agent.Ask(ctx, task.Prompt)
 	row.Answer = answer
 	row.RunID = agent.LastRunID()

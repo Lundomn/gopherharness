@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "tasks": [
+    {
+      "id": "01-list-files",
+      "category": "workspace-read",
+      "prompt": "List the workspace files and report when finished.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["list_files"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"list_files\",\"args\":{\"path\":\".\"}}</tool>",
+        "<final>workspace listed</final>"
+      ],
+      "verifier": "test -f README.md"
+    },
+    {
+      "id": "02-read-file",
+      "category": "workspace-read",
+      "prompt": "Read README.md and report when finished.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}</tool>",
+        "<final>README read</final>"
+      ],
+      "verifier": "grep -q 'GopherHarness benchmark fixture' README.md"
+    },
+    {
+      "id": "03-search",
+      "category": "workspace-search",
+      "prompt": "Search for the word GopherHarness and report when finished.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["search"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"search\",\"args\":{\"pattern\":\"GopherHarness\",\"path\":\".\"}}</tool>",
+        "<final>search complete</final>"
+      ],
+      "verifier": "grep -q 'GopherHarness' README.md"
+    },
+    {
+      "id": "04-write-file",
+      "category": "workspace-write",
+      "prompt": "Create result.txt with the benchmark-write marker.",
+      "fixture_repo": "fixtures/sample",
+      "expected_artifact": "result.txt",
+      "allowed_tools": ["write_file"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"write_file\",\"args\":{\"path\":\"result.txt\",\"content\":\"benchmark-write\"}}</tool>",
+        "<final>result created</final>"
+      ],
+      "verifier": "test \"$(cat result.txt)\" = benchmark-write"
+    },
+    {
+      "id": "05-patch-file",
+      "category": "workspace-write",
+      "prompt": "Change config.txt from mode=old to mode=new.",
+      "fixture_repo": "fixtures/sample",
+      "expected_artifact": "config.txt",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 3,
+      "responses": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"config.txt\"}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"config.txt\",\"old_text\":\"mode=old\",\"new_text\":\"mode=new\"}}</tool>",
+        "<final>configuration patched</final>"
+      ],
+      "verifier": "grep -q '^mode=new$' config.txt"
+    },
+    {
+      "id": "06-shell-write",
+      "category": "shell",
+      "prompt": "Create shell.txt using a shell command.",
+      "fixture_repo": "fixtures/sample",
+      "expected_artifact": "shell.txt",
+      "allowed_tools": ["run_shell"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"run_shell\",\"args\":{\"command\":\"printf shell-ok > shell.txt\"}}</tool>",
+        "<final>shell completed</final>"
+      ],
+      "verifier": "test \"$(cat shell.txt)\" = shell-ok"
+    },
+    {
+      "id": "07-todo-lifecycle",
+      "category": "state",
+      "prompt": "Create one todo, mark it done, then list todos.",
+      "fixture_repo": "fixtures/sample",
+      "expected_artifact": ".pico/todos.json",
+      "allowed_tools": ["todo_add", "todo_update", "todo_list"],
+      "step_budget": 4,
+      "responses": [
+        "<tool>{\"name\":\"todo_add\",\"args\":{\"text\":\"benchmark todo\"}}</tool>",
+        "<tool>{\"name\":\"todo_update\",\"args\":{\"id\":\"todo-001\",\"status\":\"done\"}}</tool>",
+        "<tool>{\"name\":\"todo_list\",\"args\":{}}</tool>",
+        "<final>todo lifecycle complete</final>"
+      ],
+      "verifier": "grep -q 'benchmark todo' .pico/todos.json"
+    },
+    {
+      "id": "08-plan-mode",
+      "category": "governance",
+      "prompt": "Enter plan mode, update the active plan, and exit plan mode.",
+      "fixture_repo": "fixtures/sample",
+      "expected_artifact": ".pico/plans/active.md",
+      "allowed_tools": ["enter_plan_mode", "read_file", "patch_file", "exit_plan_mode"],
+      "step_budget": 5,
+      "responses": [
+        "<tool>{\"name\":\"enter_plan_mode\",\"args\":{\"path\":\".pico/plans/active.md\"}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\".pico/plans/active.md\"}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\".pico/plans/active.md\",\"old_text\":\"# Active plan\\n\\n\",\"new_text\":\"# Active plan\\n\\n- benchmark plan\\n\"}}</tool>",
+        "<tool>{\"name\":\"exit_plan_mode\",\"args\":{}}</tool>",
+        "<final>plan updated</final>"
+      ],
+      "verifier": "grep -q 'benchmark plan' .pico/plans/active.md"
+    },
+    {
+      "id": "09-parser-retry",
+      "category": "reliability",
+      "prompt": "Recover from an invalid model response and finish.",
+      "fixture_repo": "fixtures/sample",
+      "step_budget": 3,
+      "responses": [
+        "not a structured response",
+        "<final>recovered after retry</final>"
+      ],
+      "verifier": "test -f README.md"
+    },
+    {
+      "id": "10-tool-allowlist-deny",
+      "category": "security",
+      "prompt": "Attempt the disallowed write and report when finished.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"write_file\",\"args\":{\"path\":\"denied.txt\",\"content\":\"must not exist\"}}</tool>",
+        "<final>disallowed write was rejected</final>"
+      ],
+      "verifier": "test ! -e denied.txt"
+    },
+    {
+      "id": "11-path-escape-deny",
+      "category": "security",
+      "prompt": "Attempt to read outside the workspace and report when finished.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"../outside.txt\"}}</tool>",
+        "<final>path escape was rejected</final>"
+      ],
+      "verifier": "test ! -e ../outside.txt"
+    },
+    {
+      "id": "12-batched-tools",
+      "category": "protocol",
+      "prompt": "Run a batched listing and search, then report when finished.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["list_files", "search"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>[{\"name\":\"list_files\",\"args\":{\"path\":\".\"}},{\"name\":\"search\",\"args\":{\"pattern\":\"marker\",\"path\":\"notes.txt\"}}]</tool>",
+        "<final>batched tools complete</final>"
+      ],
+      "verifier": "grep -q marker notes.txt"
+    }
+  ]
+}

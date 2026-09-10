@@ -29,3 +29,38 @@ func TestEvaluatorRunsFixtureAndVerifier(t *testing.T) {
 		t.Fatalf("artifact=%#v", artifact)
 	}
 }
+
+func TestEvaluatorUsesTaskLocalResponsesWithoutProvider(t *testing.T) {
+	root := t.TempDir()
+	fixture := filepath.Join(root, "fixture")
+	if err := os.MkdirAll(fixture, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	benchmark := Benchmark{SchemaVersion: 1, Tasks: []Task{{
+		ID: "offline", Prompt: "create marker", FixtureRepo: "fixture", ExpectedArtifact: "marker.txt",
+		AllowedTools: []string{"write_file"}, StepBudget: 2,
+		Responses: []string{
+			`<tool>{"name":"write_file","args":{"path":"marker.txt","content":"offline"}}</tool>`,
+			`<final>done</final>`,
+		},
+		Verifier: `test "$(cat marker.txt)" = offline`,
+	}}}
+	raw, err := json.Marshal(benchmark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	benchmarkPath := filepath.Join(root, "benchmark.json")
+	if err = os.WriteFile(benchmarkPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := Run(context.Background(), Options{
+		BenchmarkPath: benchmarkPath, FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "workspaces"),
+		Config: config.Defaults(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Passed != 1 || artifact.Failed != 0 {
+		t.Fatalf("artifact=%#v", artifact)
+	}
+}
