@@ -31,6 +31,28 @@ func TestEvaluatorRunsFixtureAndVerifier(t *testing.T) {
 	if artifact.Summary.TotalTasks != 1 || artifact.Summary.PassRate != 1 || artifact.Summary.VerifierPassRate != 1 {
 		t.Fatalf("summary=%#v", artifact.Summary)
 	}
+	row := artifact.Rows[0]
+	if row.FixtureDigest == "" || row.ArtifactDigest == "" {
+		t.Fatalf("expected reproducibility digests: %#v", row)
+	}
+	if row.VerifierExitCode != 0 {
+		t.Fatalf("verifier exit code=%d", row.VerifierExitCode)
+	}
+}
+
+func TestTruncateOutput(t *testing.T) {
+	short := "ok"
+	if got := truncateOutput(short); got != short {
+		t.Fatalf("short output changed: %q", got)
+	}
+	long := make([]byte, maxVerifierOutput+10)
+	for i := range long {
+		long[i] = 'x'
+	}
+	got := truncateOutput(string(long))
+	if len(got) != maxVerifierOutput+len("...<truncated>") || got[len(got)-len("...<truncated>"):] != "...<truncated>" {
+		t.Fatalf("unexpected truncation length/suffix: %d %q", len(got), got[len(got)-len("...<truncated>"):])
+	}
 }
 
 func TestEvaluatorUsesTaskLocalResponsesWithoutProvider(t *testing.T) {

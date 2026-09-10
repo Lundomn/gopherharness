@@ -1,7 +1,9 @@
 package evaluation
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -53,6 +55,10 @@ type Row struct {
 	ExpectedFailure    bool   `json:"expected_failure,omitempty"`
 	Category           string `json:"category,omitempty"`
 	VerifierExitCode   int    `json:"verifier_exit_code"`
+	VerifierStdout     string `json:"verifier_stdout,omitempty"`
+	VerifierStderr     string `json:"verifier_stderr,omitempty"`
+	FixtureDigest      string `json:"fixture_digest,omitempty"`
+	ArtifactDigest     string `json:"artifact_digest,omitempty"`
 	DurationMS         int64  `json:"duration_ms"`
 }
 type Summary struct {
@@ -129,6 +135,7 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 		row.FailureCategory = "fixture_copy_failed"
 		return row
 	}
+	row.FixtureDigest, _ = treeDigest(dst)
 	steps := task.StepBudget
 	if steps <= 0 {
 		steps = 6
@@ -174,10 +181,16 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 		_, err = os.Stat(artifactPath)
 		row.ArtifactExists = err == nil
 	}
+	if row.ArtifactExists && task.ExpectedArtifact != "" {
+		row.ArtifactDigest, _ = treeDigest(artifactPath)
+	}
 	row.VerifierPassed = true
 	if task.Verifier != "" {
 		cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", task.Verifier)
 		cmd.Dir = dst
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
 		if err = cmd.Run(); err != nil {
 			row.VerifierPassed = false
 			row.VerifierExitCode = 1
@@ -185,6 +198,8 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 				row.VerifierExitCode = exit.ExitCode()
 			}
 		}
+		row.VerifierStdout = truncateOutput(stdout.String())
+		row.VerifierStderr = truncateOutput(stderr.String())
 	}
 	if task.ExpectFailure {
 		row.Passed = askErr == nil && row.StopReason == task.ExpectedStopReason && row.VerifierPassed
@@ -327,6 +342,65 @@ func writeJSON(path string, v any) error {
 	}
 	return os.WriteFile(path, append(b, '\n'), 0o600)
 }
+
+const maxVerifierOutput = 4096
+
+func truncateOutput(value string) string {
+	if len(value) <= maxVerifierOutput {
+		return value
+	}
+	return value[:maxVerifierOutput] + "...<truncated>"
+}
+
+// treeDigest returns a stable SHA-256 digest for a file or directory. Directory
+// digests include relative paths, so two trees with identical bytes but
+// different layouts do not collide. Runtime metadata is excluded by callers
+// because copyTree omits .pico.
+func treeDigest(path string) (string, error) {
+	h := sha256.New()
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return "", err
+		}
+		_, _ = h.Write(b)
+		return fmt.Sprintf("sha256:%x", h.Sum(nil)), nil
+	}
+	root := filepath.Dir(path)
+	err = filepath.WalkDir(path, func(current string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if current == path || (d.IsDir() && d.Name() == ".pico") {
+			if current != path {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(root, current)
+		if err != nil {
+			return err
+		}
+		_, _ = h.Write([]byte(rel + "\x00"))
+		if !d.IsDir() {
+			b, err := os.ReadFile(current)
+			if err != nil {
+				return err
+			}
+			_, _ = h.Write(b)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sha256:%x", h.Sum(nil)), nil
+}
+
 func copyTree(src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

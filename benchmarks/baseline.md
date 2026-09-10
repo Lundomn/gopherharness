@@ -1,4 +1,8 @@
-# GopherHarness benchmark baseline
+# GopherHarness Runtime Regression Baseline
+
+> 这是一套运行时回归基线，不是 SWE-bench、Terminal-Bench 或其他公开模型能力排名。
+
+公开 benchmark 的分层和接入约束见 [benchmarks/README.md](README.md)。
 
 This is the checked-in baseline contract for the deterministic benchmark suite.
 It uses the task-local fake provider responses, so it does not require an API key,
