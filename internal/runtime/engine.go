@@ -34,7 +34,7 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 	if err := a.saveSession(); err != nil {
 		return "", err
 	}
-	if err := runStore.WriteTask(task); err != nil {
+	if err := a.writeTask(runStore, task); err != nil {
 		return "", err
 	}
 	_ = recorder.Emit("run_started", map[string]any{"task_id": task.TaskID, "request": request})
@@ -48,7 +48,7 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 			task.StopReason = model.StopPersistence
 			task.FinalAnswer = runErr.Error()
 			task.UpdatedAt = time.Now().UTC()
-			_ = runStore.WriteTask(task)
+			_ = a.writeTask(runStore, task)
 		}
 		_ = a.saveSession()
 	}()
@@ -59,7 +59,7 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 		}
 		task.Attempts++
 		task.UpdatedAt = time.Now().UTC()
-		_ = runStore.WriteTask(task)
+		_ = a.writeTask(runStore, task)
 		if received := a.drainInbox(); received > 0 {
 			_ = recorder.Emit("worker_messages_received", map[string]any{"count": received})
 			_ = a.saveSession()
@@ -102,7 +102,7 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 				notice := governance.Notice(decision)
 				a.Session.Messages = append(a.Session.Messages, model.Message{Role: "system", Content: notice, CreatedAt: time.Now().UTC()})
 				_ = recorder.Emit("final_readiness_notice", map[string]any{"action": decision.Action, "notice": notice, "reason_signature": decision.Signature})
-				_ = runStore.WriteTask(task)
+				_ = a.writeTask(runStore, task)
 				_ = a.saveSession()
 				continue
 			}
@@ -118,7 +118,7 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 			a.Memory.SetNextStep("")
 			_ = a.Memory.Promote(answer)
 			a.writeCheckpoint(runStore, recorder, task, request, "")
-			_ = runStore.WriteTask(task)
+			_ = a.writeTask(runStore, task)
 			_ = recorder.Emit("run_completed", map[string]any{"stop_reason": task.StopReason})
 			a.scheduleDream(recorder)
 			return answer, a.writeReport(runStore, task, started, promptMeta)
@@ -141,7 +141,7 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 				task.ToolSteps++
 				task.LastTool = call.Name
 				task.UpdatedAt = time.Now().UTC()
-				_ = runStore.WriteTask(task)
+				_ = a.writeTask(runStore, task)
 				content := renderToolResult(result)
 				a.Session.Messages = append(a.Session.Messages, model.Message{Role: "tool", Content: content, CreatedAt: time.Now().UTC()})
 				if call.Name == "read_file" && result.Status == "ok" {
@@ -167,7 +167,7 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 	task.StopReason = model.StopStepLimit
 	task.FinalAnswer = "Stopped after reaching the configured step limit."
 	task.UpdatedAt = time.Now().UTC()
-	_ = runStore.WriteTask(task)
+	_ = a.writeTask(runStore, task)
 	_ = recorder.Emit("run_completed", map[string]any{"stop_reason": task.StopReason})
 	return task.FinalAnswer, a.writeReport(runStore, task, started, promptMeta)
 }
@@ -205,14 +205,35 @@ func (a *Agent) denied(recorder *evidence.Recorder, call model.ToolCall, reason,
 	return r
 }
 func (a *Agent) writeReport(runStore *store.RunStore, task *model.TaskState, started time.Time, promptMeta map[string]any) error {
-	return runStore.WriteReport(&model.RunReport{SchemaVersion: model.ArtifactSchema, RunID: runStore.RunID, SessionID: a.Session.ID, Status: task.Status, StopReason: task.StopReason, FinalAnswer: task.FinalAnswer, Attempts: task.Attempts, ToolSteps: task.ToolSteps, Provider: a.Provider.Name(), Model: a.Provider.Model(), PromptMeta: promptMeta, StartedAt: started, FinishedAt: time.Now().UTC()})
+	finalAnswer := task.FinalAnswer
+	if a.Redactor != nil {
+		finalAnswer = a.Redactor.Text(finalAnswer)
+	}
+	return runStore.WriteReport(&model.RunReport{SchemaVersion: model.ArtifactSchema, RunID: runStore.RunID, SessionID: a.Session.ID, Status: task.Status, StopReason: task.StopReason, FinalAnswer: finalAnswer, Attempts: task.Attempts, ToolSteps: task.ToolSteps, Provider: a.Provider.Name(), Model: a.Provider.Model(), PromptMeta: promptMeta, StartedAt: started, FinishedAt: time.Now().UTC()})
 }
+
+func (a *Agent) writeTask(runStore *store.RunStore, task *model.TaskState) error {
+	snapshot := *task
+	if a.Redactor != nil {
+		snapshot.UserRequest = a.Redactor.Text(snapshot.UserRequest)
+		snapshot.FinalAnswer = a.Redactor.Text(snapshot.FinalAnswer)
+		if len(snapshot.ChangedPaths) > 0 {
+			paths := make([]string, len(snapshot.ChangedPaths))
+			for index, path := range snapshot.ChangedPaths {
+				paths[index] = a.Redactor.Text(path)
+			}
+			snapshot.ChangedPaths = paths
+		}
+	}
+	return runStore.WriteTask(&snapshot)
+}
+
 func (a *Agent) finishError(runStore *store.RunStore, task *model.TaskState, started time.Time, promptMeta map[string]any, reason string, err error) (string, error) {
 	task.Status = model.StatusFailed
 	task.StopReason = reason
 	task.FinalAnswer = err.Error()
 	task.UpdatedAt = time.Now().UTC()
-	_ = runStore.WriteTask(task)
+	_ = a.writeTask(runStore, task)
 	recorder := evidence.New(runStore, a.Sessions, a.Session.ID, a.Redactor)
 	_ = recorder.Emit("run_failed", map[string]any{"stop_reason": reason, "error": err.Error()})
 	_ = a.writeReport(runStore, task, started, promptMeta)

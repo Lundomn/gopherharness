@@ -139,7 +139,7 @@ func TestSessionAndTracePersistenceRedactSecrets(t *testing.T) {
 	secret := "sk-abcdefghijklmnop"
 	fake := &provider.Fake{Responses: []string{
 		`<tool>{"name":"todo_add","args":{"text":"sk-abcdefghijklmnop"}}</tool>`,
-		`<final>done</final>`,
+		`<final>done sk-abcdefghijklmnop</final>`,
 	}}
 	agent, err := New(Options{Root: root, Config: config.Defaults(), Provider: fake, Approval: permission.Auto, DisableAutoDream: true})
 	if err != nil {
@@ -152,6 +152,8 @@ func TestSessionAndTracePersistenceRedactSecrets(t *testing.T) {
 		filepath.Join(root, ".pico", "sessions", agent.SessionID()+".json"),
 		filepath.Join(root, ".pico", "sessions", agent.SessionID()+".events.jsonl"),
 		filepath.Join(root, ".pico", "runs", agent.LastRunID(), "trace.jsonl"),
+		filepath.Join(root, ".pico", "runs", agent.LastRunID(), "task_state.json"),
+		filepath.Join(root, ".pico", "runs", agent.LastRunID(), "report.json"),
 	}
 	for _, path := range paths {
 		data, readErr := os.ReadFile(path)

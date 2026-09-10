@@ -144,15 +144,17 @@ prompt, allowed tools, step budget, expected artifact, and verifier command.
   --artifact artifacts/go-benchmark.json
 ```
 
-The repository includes 12 deterministic offline tasks covering workspace I/O,
+The repository includes 20 deterministic offline tasks covering workspace I/O,
 Shell, state, plan governance, protocol recovery, tool allowlists, path safety,
-and batched tool calls. Run the baseline without a provider key:
+fresh-read enforcement, timeout handling, large-output artifacts, memory and
+checkpoint persistence, redaction, and an intentional step-limit negative
+control. Run the baseline without a provider key:
 
 ```bash
 make benchmark
 ```
 
-See [benchmark baseline](benchmarks/baseline.md) for the expected 12/12 result.
+See [benchmark baseline](benchmarks/baseline.md) for the expected 20/20 result.
 
 ## Verification
 

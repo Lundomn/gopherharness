@@ -28,6 +28,9 @@ func TestEvaluatorRunsFixtureAndVerifier(t *testing.T) {
 	if artifact.Passed != 1 || artifact.Failed != 0 {
 		t.Fatalf("artifact=%#v", artifact)
 	}
+	if artifact.Summary.TotalTasks != 1 || artifact.Summary.PassRate != 1 || artifact.Summary.VerifierPassRate != 1 {
+		t.Fatalf("summary=%#v", artifact.Summary)
+	}
 }
 
 func TestEvaluatorUsesTaskLocalResponsesWithoutProvider(t *testing.T) {
@@ -38,7 +41,7 @@ func TestEvaluatorUsesTaskLocalResponsesWithoutProvider(t *testing.T) {
 	}
 	benchmark := Benchmark{SchemaVersion: 1, Tasks: []Task{{
 		ID: "offline", Prompt: "create marker", FixtureRepo: "fixture", ExpectedArtifact: "marker.txt",
-		AllowedTools: []string{"write_file"}, StepBudget: 2,
+		AllowedTools: []string{"write_file"}, StepBudget: 2, Category: "workspace-write",
 		Responses: []string{
 			`<tool>{"name":"write_file","args":{"path":"marker.txt","content":"offline"}}</tool>`,
 			`<final>done</final>`,
@@ -62,5 +65,63 @@ func TestEvaluatorUsesTaskLocalResponsesWithoutProvider(t *testing.T) {
 	}
 	if artifact.Passed != 1 || artifact.Failed != 0 {
 		t.Fatalf("artifact=%#v", artifact)
+	}
+	if artifact.Summary.ExpectedFailures != 0 || artifact.Summary.CategoryCounts["workspace-write"] != 1 {
+		t.Fatalf("summary=%#v", artifact.Summary)
+	}
+}
+
+func TestEvaluatorAcceptsDeclaredNegativeControl(t *testing.T) {
+	root := t.TempDir()
+	fixture := filepath.Join(root, "fixture")
+	if err := os.MkdirAll(fixture, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fixture, "README.md"), []byte("fixture\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	benchmark := Benchmark{SchemaVersion: 1, Tasks: []Task{{
+		ID: "limit", Prompt: "keep listing", FixtureRepo: "fixture", Category: "reliability",
+		AllowedTools: []string{"list_files"}, StepBudget: 1, ExpectFailure: true,
+		ExpectedStopReason: "step_limit_reached", Responses: []string{
+			`<tool>{"name":"list_files","args":{"path":"."}}</tool>`,
+		}, Verifier: "test -f README.md",
+	}}}
+	raw, err := json.Marshal(benchmark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	benchmarkPath := filepath.Join(root, "benchmark.json")
+	if err = os.WriteFile(benchmarkPath, raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := Run(context.Background(), Options{BenchmarkPath: benchmarkPath, FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "workspaces"), Config: config.Defaults()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.Passed != 1 || artifact.Summary.ExpectedFailures != 1 || artifact.Rows[0].StopReason != "step_limit_reached" {
+		t.Fatalf("artifact=%#v", artifact)
+	}
+}
+
+func TestValidateBenchmarkRejectsUnsafeTaskPaths(t *testing.T) {
+	root := t.TempDir()
+	fixture := filepath.Join(root, "fixture")
+	if err := os.MkdirAll(fixture, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	base := Task{ID: "safe", Prompt: "p", FixtureRepo: "fixture", AllowedTools: []string{"read_file"}, StepBudget: 1, Verifier: "true"}
+	for name, mutate := range map[string]func(*Task){
+		"task id traversal":  func(task *Task) { task.ID = "../escape" },
+		"absolute fixture":   func(task *Task) { task.FixtureRepo = filepath.Join(root, "fixture") },
+		"artifact traversal": func(task *Task) { task.ExpectedArtifact = "../escape.txt" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			task := base
+			mutate(&task)
+			if err := validateBenchmark(Benchmark{SchemaVersion: 1, Tasks: []Task{task}}, root); err == nil {
+				t.Fatal("unsafe benchmark was accepted")
+			}
+		})
 	}
 }

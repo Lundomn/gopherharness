@@ -78,13 +78,13 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 	err = cmd.Run()
 	result := Result{Stdout: stdout.String(), Stderr: stderr.String(), Backend: backend}
 	if err != nil {
+		if ctx.Err() != nil {
+			return result, fmt.Errorf("shell timeout after %ds", seconds)
+		}
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {
 			result.ExitCode = exit.ExitCode()
 			return result, nil
-		}
-		if ctx.Err() != nil {
-			return result, fmt.Errorf("shell timeout after %ds", seconds)
 		}
 		return result, err
 	}

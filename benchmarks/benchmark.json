@@ -121,6 +121,7 @@
       "category": "reliability",
       "prompt": "Recover from an invalid model response and finish.",
       "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["read_file"],
       "step_budget": 3,
       "responses": [
         "not a structured response",
@@ -166,6 +167,118 @@
         "<final>batched tools complete</final>"
       ],
       "verifier": "grep -q marker notes.txt"
+    },
+    {
+      "id": "13-fresh-read-recovery",
+      "category": "workspace-write",
+      "prompt": "Recover from a write without a fresh read, then change config.txt to mode=new.",
+      "fixture_repo": "fixtures/sample",
+      "expected_artifact": "config.txt",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "responses": [
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"config.txt\",\"old_text\":\"mode=old\",\"new_text\":\"mode=new\"}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"config.txt\"}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"config.txt\",\"old_text\":\"mode=old\",\"new_text\":\"mode=new\"}}</tool>",
+        "<final>fresh read recovery complete</final>"
+      ],
+      "verifier": "grep -q '^mode=new$' config.txt && grep -q '\"status\":\"error\"' .pico/runs/*/trace.jsonl"
+    },
+    {
+      "id": "14-invalid-patch-recovery",
+      "category": "reliability",
+      "prompt": "Recover from an invalid patch target and then update config.txt to mode=recovered.",
+      "fixture_repo": "fixtures/sample",
+      "expected_artifact": "config.txt",
+      "allowed_tools": ["read_file", "patch_file"],
+      "step_budget": 4,
+      "responses": [
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"config.txt\",\"old_text\":\"not-present\",\"new_text\":\"mode=recovered\"}}</tool>",
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"config.txt\"}}</tool>",
+        "<tool>{\"name\":\"patch_file\",\"args\":{\"path\":\"config.txt\",\"old_text\":\"mode=old\",\"new_text\":\"mode=recovered\"}}</tool>",
+        "<final>invalid patch recovery complete</final>"
+      ],
+      "verifier": "grep -q '^mode=recovered$' config.txt && grep -q '\"status\":\"error\"' .pico/runs/*/trace.jsonl"
+    },
+    {
+      "id": "15-invalid-search-recovery",
+      "category": "reliability",
+      "prompt": "Recover from an invalid search pattern and then find the marker in notes.txt.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["search"],
+      "step_budget": 3,
+      "responses": [
+        "<tool>{\"name\":\"search\",\"args\":{\"pattern\":\"[\",\"path\":\"notes.txt\"}}</tool>",
+        "<tool>{\"name\":\"search\",\"args\":{\"pattern\":\"marker\",\"path\":\"notes.txt\"}}</tool>",
+        "<final>invalid search recovery complete</final>"
+      ],
+      "verifier": "grep -q marker notes.txt && grep -q '\"status\":\"error\"' .pico/runs/*/trace.jsonl"
+    },
+    {
+      "id": "16-shell-timeout",
+      "category": "reliability",
+      "prompt": "Run the intentionally slow command with a one-second timeout, observe the failure, and finish.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["run_shell"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"run_shell\",\"args\":{\"command\":\"sleep 2\",\"timeout\":1}}</tool>",
+        "<final>timeout was handled</final>"
+      ],
+      "verifier": "grep -q '\"status\":\"error\"' .pico/runs/*/trace.jsonl"
+    },
+    {
+      "id": "17-large-output-artifact",
+      "category": "evidence",
+      "prompt": "Run a command that produces a large output and finish.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["run_shell"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"run_shell\",\"args\":{\"command\":\"yes x | head -n 20000\"}}</tool>",
+        "<final>large output captured</final>"
+      ],
+      "verifier": "find .pico/runs -type f -path '*/artifacts/*' -print -quit | grep -q ."
+    },
+    {
+      "id": "18-memory-and-checkpoint",
+      "category": "state",
+      "prompt": "Read README.md, record that the benchmark checkpoint is persisted, and finish.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["read_file"],
+      "step_budget": 2,
+      "responses": [
+        "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}</tool>",
+        "<final>Decision: benchmark checkpoint is persisted</final>"
+      ],
+      "verifier": "grep -q 'README.md' .pico/memory/working.json && test -f .pico/memory/topics/project.md && test -f .pico/runs/*/checkpoint.json"
+    },
+    {
+      "id": "19-memory-redaction",
+      "category": "security",
+      "prompt": "Persist only the stable benchmark fact and reject secret-shaped content.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["read_file"],
+      "step_budget": 1,
+      "responses": [
+        "<final>Decision: benchmark durable fact\nDependency: api_key=bench-secret-token-001</final>"
+      ],
+      "verifier": "grep -q 'benchmark durable fact' .pico/memory/topics/project.md && ! grep -R -q 'bench-secret-token-001' .pico"
+    },
+    {
+      "id": "20-step-limit-is-observed",
+      "category": "reliability",
+      "prompt": "Keep listing files until the runtime step limit stops the task.",
+      "fixture_repo": "fixtures/sample",
+      "allowed_tools": ["list_files"],
+      "step_budget": 2,
+      "expect_failure": true,
+      "expected_stop_reason": "step_limit_reached",
+      "responses": [
+        "<tool>{\"name\":\"list_files\",\"args\":{\"path\":\".\"}}</tool>",
+        "<tool>{\"name\":\"list_files\",\"args\":{\"path\":\".\"}}</tool>"
+      ],
+      "verifier": "grep -q '\"stop_reason\": \"step_limit_reached\"' .pico/runs/*/report.json"
     }
   ]
 }

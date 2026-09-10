@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOffRunnerExecutesCommand(t *testing.T) {
@@ -14,6 +15,18 @@ func TestOffRunnerExecutesCommand(t *testing.T) {
 	out, err := r.Run(context.Background(), "printf hello", t.TempDir(), []string{"PATH=/usr/bin:/bin"}, 10)
 	if err != nil || out.ExitCode != 0 || strings.TrimSpace(out.Stdout) != "hello" || out.Backend != "none" {
 		t.Fatalf("out=%#v err=%v", out, err)
+	}
+}
+
+func TestRunnerReportsTimeoutInsteadOfSuccessfulExit(t *testing.T) {
+	r := New(Config{Mode: "off", Backend: "none", WorkspaceWrite: true})
+	started := time.Now()
+	result, err := r.Run(context.Background(), "sleep 2", t.TempDir(), []string{"PATH=/usr/bin:/bin"}, 1)
+	if err == nil || !strings.Contains(err.Error(), "shell timeout") {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if time.Since(started) > 1500*time.Millisecond {
+		t.Fatalf("timeout took too long: %s", time.Since(started))
 	}
 }
 func TestRequiredSandboxFailsWithoutBackendOnNonLinux(t *testing.T) {

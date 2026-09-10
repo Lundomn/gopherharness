@@ -26,12 +26,14 @@ go run ./cmd/gopherharness-eval \
 
 | Metric | Expected |
 | --- | ---: |
-| Tasks | 12 |
-| Passed | 12 |
+| Tasks | 20 |
+| Passed | 20 |
 | Failed | 0 |
-| Categories | workspace-read, workspace-search, workspace-write, shell, state, governance, reliability, security, protocol |
+| Categories | workspace-read, workspace-search, workspace-write, shell, state, governance, reliability, security, protocol, evidence |
 | Maximum task steps | 5 |
 
 The generated JSON artifact contains per-task attempts, tool steps, verifier
-status, and duration. Runtime IDs and timestamps are intentionally generated at
-run time and are not committed as source fixtures.
+status, stop reason, expected-failure handling, category counts, and duration.
+Task 20 is an intentional negative control: it passes only when the runtime
+stops with `step_limit_reached`. Runtime IDs and timestamps are intentionally
+generated at run time and are not committed as source fixtures.
