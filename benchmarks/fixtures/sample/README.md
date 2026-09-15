@@ -1,3 +1,3 @@
-# GopherHarness benchmark fixture
+# GopherHarness benchmark fixture（评测样例仓库）
 
-This small repository is copied into an isolated workspace for each benchmark task.
+这个小型仓库会在每个 benchmark 任务开始时复制到独立工作区。

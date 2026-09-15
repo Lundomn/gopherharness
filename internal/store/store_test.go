@@ -35,3 +35,12 @@ func TestSessionAndRunArtifacts(t *testing.T) {
 		}
 	}
 }
+
+func TestSessionLoadRejectsPathTraversal(t *testing.T) {
+	ss := NewSessionStore(t.TempDir())
+	for _, id := range []string{"../outside", "/tmp/outside", "..", "."} {
+		if _, err := ss.Load(id); err == nil {
+			t.Fatalf("session id %q was accepted", id)
+		}
+	}
+}

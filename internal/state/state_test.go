@@ -1,6 +1,9 @@
 package state
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -28,5 +31,26 @@ func TestTodoAndPlanState(t *testing.T) {
 	active, _ = plan.Active()
 	if active {
 		t.Fatal("plan remained active")
+	}
+}
+
+func TestPlanRejectsSymlinkEscape(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink permissions vary on Windows")
+	}
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	if _, err := NewPlan(root).Enter("linked/plan.md"); err == nil {
+		t.Fatal("plan path through an outside symlink was accepted")
+	}
+}
+
+func TestPlanRejectsAbsolutePath(t *testing.T) {
+	root := t.TempDir()
+	if _, err := NewPlan(root).Enter(filepath.Join(root, "plan.md")); err == nil {
+		t.Fatal("absolute plan path was accepted")
 	}
 }

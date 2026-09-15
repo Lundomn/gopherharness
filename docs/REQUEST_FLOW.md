@@ -1,11 +1,9 @@
-# Request flow
+# 请求链路
 
-This document is the shortest path through GopherHarness. Each arrow is an explicit
-package boundary; persistence and policy do not happen implicitly inside a
-provider or tool.
+这是 GopherHarness 最短的端到端调用路径。每个箭头都是明确的 package 边界；持久化和策略判断不会隐式发生在 provider 或工具内部。
 
 ```text
-cmd/gopherharness or cmd/gopherharness-tui
+cmd/gopherharness 或 cmd/gopherharness-tui
         |
         v
 internal/app.Run
@@ -17,58 +15,49 @@ runtime.New
         |
         v
 Agent.Ask(ctx, request)
-  serialize the main session and create RunStore + evidence.Recorder
+  串行化主 session，并创建 RunStore + evidence.Recorder
         |
         v
 contextbuilder.Build -> provider.Complete/Stream -> protocol.Parse
         |                                      |
-        | tools                                | final/retry
+        | 工具调用                                 | 最终回答/重试
         v                                      v
 allowlist -> plan -> approval -> handler    governance.Evaluate
         |                                      |
         v                                      v
-workspace/sandbox -> ToolResult            remind/block/allow
+workspace/sandbox -> ToolResult            提醒/阻止/允许
         |                                      |
         +----------> session + checkpoint <---+
                          |
                          v
-             redacted trace/report/session
+             脱敏后的 trace/report/session
                          |
                          v
-                  optional auto-dream
+                    可选 auto-dream
 ```
 
-## One tool call
+## 一次工具调用
 
-1. `protocol.Parse` creates `model.ToolCall`.
-2. `runtime.executeTool` checks the active allowlist.
-3. Plan mode limits writes, then `permission.Check` applies user policy.
-4. `tools.Registry` looks up the registered `Spec + Handler` pair.
-5. The handler calls the narrow `tools.Host` interface; it cannot reach runtime
-   internals directly.
-6. Paths pass through `workspace.Resolve`; shell commands pass through
-   `sandbox.Run`.
-7. `model.ToolResult` returns to the transcript, while `evidence.Recorder`
-   writes a recursively redacted event.
-8. Changed paths reset verification state. Recognized test/build/lint commands
-   update verification evidence.
+1. `protocol.Parse` 创建 `model.ToolCall`。
+2. `runtime.executeTool` 检查当前 allowlist。
+3. plan mode 限制写操作，随后由 `permission.Check` 应用用户策略。
+4. `tools.Registry` 查找注册的 `Spec + Handler` 对。
+5. handler 只调用窄接口 `tools.Host`，不能直接访问 runtime 内部。
+6. 路径经过 `workspace.Resolve`；Shell 命令经过 `sandbox.Run`。
+7. `model.ToolResult` 返回 transcript，同时 `evidence.Recorder` 写入递归脱敏后的 event。
+8. 工作区发生变更时重置验证状态；识别出的 test/build/lint 命令会更新验证证据。
 
-## One final answer
+## 一次最终回答
 
-1. `protocol.Parse` proposes final text.
-2. `governance.Evaluate` checks changed paths, verification, and live workers.
-3. `off`, `warn`, `soft`, and `strict` decide whether to allow, remind, or
-   block the proposal.
-4. An accepted final writes a fresh checkpoint with the current workspace
-   fingerprint, closes plan mode, promotes durable memory, and writes the run
-   report.
-5. Auto-dream may be submitted after its session and interval gates pass.
+1. `protocol.Parse` 提议最终文本。
+2. `governance.Evaluate` 检查变更路径、验证证据和活动 worker。
+3. `off`、`warn`、`soft`、`strict` 决定允许、提醒或阻止提议。
+4. 接受后写入带当前 workspace fingerprint 的 checkpoint，退出 plan mode，晋升持久 memory，并写入 run report。
+5. session 和 interval 门控通过后，可能提交 auto-dream。
 
-## Resume flow
+## 恢复链路
 
-`runtime.New --resume` loads the session and its latest completed run
-checkpoint. It compares the checkpoint schema and workspace fingerprint and
-records one of:
+`runtime.New --resume` 加载 session 和最近一次完成的 run checkpoint，比较 checkpoint schema 与 workspace fingerprint，并记录以下状态之一：
 
 ```text
 no-checkpoint
@@ -77,17 +66,12 @@ schema-mismatch
 workspace-mismatch
 ```
 
-Only a `full-valid` checkpoint restores its goal and next step into working
-memory. The status is persisted in the next `task_state.json`.
+只有 `full-valid` checkpoint 会将 goal 和 next step 恢复到 working memory；状态会写入下一份 `task_state.json`。
 
-## Extension rules
+## 扩展规则
 
-- New model protocol: implement `provider.Client`; add `StreamClient` or
-  `VisionClient` only when supported.
-- New tool: register one `tools.Definition` containing its public `Spec` and
-  `Handler`; keep OS and workspace access behind `tools.Host`.
-- New evidence: emit through `evidence.Recorder`, never write trace JSONL from
-  feature code.
-- New terminal policy: add evidence and decisions in `internal/governance`, not
-  in the provider or TUI.
-- New background work: own a cancellation path and include it in `Agent.Close`.
+- 新增模型协议：实现 `provider.Client`；只有 provider 确实支持时才增加 `StreamClient` 或 `VisionClient`。
+- 新增工具：注册一个包含公共 `Spec` 和 `Handler` 的 `tools.Definition`；操作系统和工作区访问必须经过 `tools.Host`。
+- 新增证据：通过 `evidence.Recorder` 发出，不要在业务功能中直接写 trace JSONL。
+- 新增终态策略：在 `internal/governance` 增加证据和决策，不要放在 provider 或 TUI。
+- 新增后台任务：必须拥有取消路径，并纳入 `Agent.Close` 的等待范围。

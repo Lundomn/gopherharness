@@ -206,6 +206,8 @@ func (a *Agent) SessionID() string      { return a.Session.ID }
 func (a *Agent) LastRunID() string      { return a.lastRun }
 func (a *Agent) Usage() (int, int, int) { return a.usageInput, a.usageOutput, a.modelCalls }
 func (a *Agent) Reset() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	a.Session = a.Sessions.New(a.Workspace.Root)
 	a.ResumeStatus = model.ResumeNone
 	return a.saveSession()

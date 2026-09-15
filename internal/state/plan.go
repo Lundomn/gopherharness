@@ -1,10 +1,12 @@
 package state
 
 import (
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
+
+	"github.com/Lundomn/gopherharness/internal/workspace"
 )
 
 type PlanController struct {
@@ -20,13 +22,17 @@ func (p *PlanController) Enter(rel string) (string, error) {
 		rel = ".pico/plans/active.md"
 	}
 	if filepath.IsAbs(rel) {
-		return "", fmt.Errorf("plan path must be workspace-relative")
+		return "", errors.New("plan path must be workspace-relative")
 	}
-	clean := filepath.Clean(rel)
-	if clean == ".." || len(clean) > 3 && clean[:3] == "../" {
-		return "", fmt.Errorf("plan path escapes workspace")
+	w, err := workspace.Open(p.root)
+	if err != nil {
+		return "", err
 	}
-	path := filepath.Join(p.root, clean)
+	path, err := w.Resolve(rel)
+	if err != nil {
+		return "", err
+	}
+	clean := w.Relative(path)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return "", err
 	}

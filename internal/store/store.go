@@ -39,6 +39,9 @@ func (s *SessionStore) Load(id string) (*model.Session, error) {
 			return nil, err
 		}
 	}
+	if id == "" || id == "." || id == ".." || filepath.Base(id) != id || strings.ContainsAny(id, `/\\`) {
+		return nil, fmt.Errorf("invalid session id")
+	}
 	var session model.Session
 	if err := readJSON(filepath.Join(s.Dir, id+".json"), &session); err != nil {
 		return nil, err

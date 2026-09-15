@@ -1,55 +1,41 @@
-# GopherHarness architecture
+# GopherHarness 系统架构
 
-GopherHarness is organized into three explicit planes:
+GopherHarness 按职责划分为三个明确的平面：
 
 ```text
-Control plane
-  cmd/gopherharness, cmd/gopherharness-tui
+控制平面
+  cmd/gopherharness、cmd/gopherharness-tui
     -> internal/app
     -> internal/runtime.Agent
-    -> internal/runtime.run turn state machine
+    -> internal/runtime.run 回合状态机
     -> provider / protocol / tools / governance
 
-State plane
-  session -> working memory -> checkpoint -> todos / plan / workers
+状态平面
+  session -> working memory -> checkpoint -> todo / plan / worker
 
-Evidence plane
+证据平面
   runtime event -> evidence.Recorder -> redactor
     -> task_state.json / trace.jsonl / session events / report.json
 ```
 
-## Request lifecycle
+## 请求生命周期
 
-1. `app.Run` resolves flags, `.pico.toml`, environment overrides, and provider.
-2. `runtime.New` validates resume checkpoints and builds the workspace,
-   session, memory, tool registry, plan, todo ledger, workers, skills, sandbox,
-   and redactor.
-3. `Agent.Ask` serializes turns for the main session.
-4. `run` creates the run directory and writes the first task state before the
-   model call.
-5. `contextbuilder.Build` assembles stable instructions, tools, skills,
-   workspace, memory, history, and the current request.
-6. The provider returns JSON or SSE text; `protocol.Parse` classifies the full
-   response as tools, final, or retry. The TUI streams only final-answer text.
-7. Every tool crosses allowlist, plan-mode, approval, registered handler,
-   workspace, and sandbox boundaries before execution.
-8. Tool output is appended to the transcript; large output is moved to a run
-   artifact. The runtime updates memory, checkpoint, trace, and session events.
-9. Final readiness evaluates changed paths, verification evidence, and live
-   workers before accepting an answer.
-10. Accepted answers write a current checkpoint, promote durable facts, close
-    task state and report, and may submit gated background dream consolidation.
+1. `app.Run` 解析命令行参数、项目配置、环境变量和 provider。
+2. `runtime.New` 校验恢复 checkpoint，并创建 workspace、session、memory、工具注册表、plan、todo、worker、skills、sandbox 和 redactor。
+3. `Agent.Ask` 为主 session 串行化回合。
+4. `run` 创建运行目录，并在调用模型前写入第一份任务状态。
+5. `contextbuilder.Build` 组装稳定指令、工具、skills、workspace、memory、历史记录和当前请求。
+6. provider 返回 JSON 或 SSE 文本；`protocol.Parse` 将完整响应分类为工具调用、最终回答或重试。TUI 只流式展示最终回答文本。
+7. 每个工具执行前都要经过 allowlist、plan mode、approval、注册 handler、workspace 和 sandbox 边界。
+8. 工具输出加入 transcript；过大的输出转为 run artifact。runtime 同步更新 memory、checkpoint、trace 和 session event。
+9. final readiness 检查变更路径、验证证据和活动 worker，决定是否接受回答。
+10. 接受最终回答后，写入最新 checkpoint、晋升持久事实、关闭任务状态和报告，并可在门控通过后提交后台 dream consolidation。
 
-## Concurrency model
+## 并发模型
 
-The main session is protected by a mutex, so two callers cannot mutate one
-transcript concurrently. Workers run in goroutines with independent sessions,
-bounded steps, cancellation contexts, and consumed inbox channels. Dream runs
-in a bounded background goroutine protected by a filesystem lock and a wait
-group. `Agent.Close` cancels and joins workers, then waits for memory
-maintenance. Shared memory and workspace read tracking have their own locks.
+主 session 由 mutex 保护，避免两个调用者同时修改 transcript。Worker 在独立 session 中运行于 goroutine，拥有步数上限、取消 context 和已消费的 inbox channel。Dream 在受限后台 goroutine 中运行，由文件锁和 wait group 保护。`Agent.Close` 会取消并等待 worker，再等待 memory maintenance。共享 memory 和 workspace read tracking 各自拥有锁。
 
-## Persistence contract
+## 持久化契约
 
 ```text
 .pico/
@@ -68,19 +54,14 @@ maintenance. Shared memory and workspace read tracking have their own locks.
   plans/active.md
 ```
 
-Files are written with restricted permissions where they can contain provider
-or task data. Trace, session event, and session snapshot persistence passes
-through recursive key-, pattern-, and configured-secret redaction.
+可能包含 provider 或任务数据的文件会使用受限权限写入。trace、session event 和 session snapshot 在落盘前都会经过递归的 key、pattern 和配置 secret 脱敏。
 
-## Design choices specific to Go
+## Go 设计选择
 
-- `context.Context` owns cancellation and shell/model timeouts.
-- Interfaces keep providers and the tool host testable without network calls.
-- Goroutines and channels provide isolated background workers.
-- Concrete Go structs carry the data contracts; validation happens at registry
-  and boundary methods.
-- The standard library is used throughout, so the runtime builds without
-  third-party Go dependencies.
+- `context.Context` 统一管理取消和 Shell/模型超时。
+- 使用接口隔离 provider 与工具宿主，便于无网络测试。
+- 使用 goroutine 和 channel 实现隔离的后台 worker。
+- 使用具体 Go struct 承载数据契约，在 registry 和边界方法执行校验。
+- 全部使用标准库，运行时不依赖第三方 Go 包。
 
-See [request flow](REQUEST_FLOW.md) for the end-to-end call chain and extension
-rules.
+完整请求链路和扩展规则见[请求链路文档](REQUEST_FLOW.md)。

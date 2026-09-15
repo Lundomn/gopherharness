@@ -1,21 +1,18 @@
-# GopherHarness Runtime Regression Baseline
+# GopherHarness 运行时回归基线
 
 > 这是一套运行时回归基线，不是 SWE-bench、Terminal-Bench 或其他公开模型能力排名。
 
 公开 benchmark 的分层和接入约束见 [benchmarks/README.md](README.md)。
 
-This is the checked-in baseline contract for the deterministic benchmark suite.
-It uses the task-local fake provider responses, so it does not require an API key,
-network access, or a live model. Each task receives a fresh copy of
-`benchmarks/fixtures/sample`.
+这是仓库提交的确定性 benchmark 基线契约。它使用任务内置的 fake provider 响应，因此不需要 API key、网络或在线模型。每个任务都会获得一份全新的 `benchmarks/fixtures/sample` 副本。
 
-## Run
+## 运行
 
 ```bash
 make benchmark
 ```
 
-Equivalent command:
+等价命令：
 
 ```bash
 go run ./cmd/gopherharness-eval \
@@ -26,18 +23,14 @@ go run ./cmd/gopherharness-eval \
   --artifact artifacts/go-benchmark.json
 ```
 
-## Expected baseline
+## 预期基线
 
 | Metric | Expected |
 | --- | ---: |
 | Tasks | 20 |
 | Passed | 20 |
 | Failed | 0 |
-| Categories | workspace-read, workspace-search, workspace-write, shell, state, governance, reliability, security, protocol, evidence |
-| Maximum task steps | 5 |
+| 类别 | workspace-read、workspace-search、workspace-write、shell、state、governance、reliability、security、protocol、evidence |
+| 最大任务步数 | 5 |
 
-The generated JSON artifact contains per-task attempts, tool steps, verifier
-status, stop reason, expected-failure handling, category counts, and duration.
-Task 20 is an intentional negative control: it passes only when the runtime
-stops with `step_limit_reached`. Runtime IDs and timestamps are intentionally
-generated at run time and are not committed as source fixtures.
+生成的 JSON artifact 包含每个任务的 attempts、tool steps、verifier 状态、stop reason、预期失败处理、类别统计和耗时。任务 20 是有意设置的负向控制：只有 runtime 以 `step_limit_reached` 停止时才算通过。Runtime ID 和时间戳会在运行时生成，不会作为 source fixture 提交。

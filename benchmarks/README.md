@@ -2,7 +2,7 @@
 
 本目录包含两类不同目的的评测，名称和结论必须区分：
 
-## 1. GopherHarness Runtime Regression
+## 1. GopherHarness 运行时回归（Runtime Regression）
 
 `benchmark.json` 是仓库内置的 20 个确定性任务。它们使用固定响应和本地 fixture，检查工具协议、沙箱、恢复、记忆、证据和治理行为。
 
@@ -18,7 +18,7 @@ make benchmark
 
 预期结果为 `20/20`，其中任务 20 是一个有意触发 `step_limit_reached` 的负向控制。
 
-## 2. Public Agent Benchmark
+## 2. 公开 Agent Benchmark（公开 Agent 评测）
 
 公开 benchmark 必须使用外部发布、版本固定的任务集和官方 verifier，而不是把固定答案写进任务响应。每次运行至少记录：
 
@@ -30,7 +30,7 @@ make benchmark
 - 每个任务的成功/失败、超预算和基础设施错误；
 - 可复现的完整 JSONL 结果，而不是只报告一个百分比。
 
-GopherHarness 的第一优先级是 **SWE-bench Verified**：它与编码 agent 的工作流最匹配，任务来自真实 GitHub issue，结果由仓库测试验证。第二阶段再接入 Terminal-Bench，用于评估更广泛的终端环境操作能力。
+GopherHarness 的第一优先级是 **SWE-bench Verified**：它与编码 Agent 的工作流最匹配，任务来自真实 GitHub issue，结果由仓库测试验证。第二阶段再接入 Terminal-Bench，用于评估更广泛的终端环境操作能力。
 
 运行公开 benchmark 时，必须保留原始任务集和官方评测脚本的版本信息，并把公开 benchmark 的结果与本目录的 runtime regression 分开发布。
 
@@ -42,5 +42,4 @@ GopherHarness 的第一优先级是 **SWE-bench Verified**：它与编码 agent 
 
 ## 当前状态
 
-当前仓库已经具备可重复的 runtime regression 基线、任务级 verifier、负向控制、预算统计、fixture 隔离和 evidence 脱敏。公开 benchmark 接入不能复用 `benchmark.json` 的 fake provider；下一步应新增独立的 SWE-bench adapter，消费用户本地下载并固定版本的实例 JSONL，调用真实 provider，并委托官方 harness 执行测试。
-
+当前仓库已经具备可重复的 runtime regression 基线、任务级 verifier、负向控制、预算统计、fixture 隔离和 evidence 脱敏。公开 benchmark 接入不能复用 `benchmark.json` 的 fake provider；下一步应新增独立的 SWE-bench adapter，读取用户本地下载并固定版本的实例 JSONL，调用真实 provider，并委托官方 harness 执行测试。
