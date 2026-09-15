@@ -1,6 +1,6 @@
 # GopherHarness architecture
 
-GopherHarness keeps the three planes from the Pico v3 behavioral reference:
+GopherHarness is organized into three explicit planes:
 
 ```text
 Control plane
@@ -76,9 +76,9 @@ through recursive key-, pattern-, and configured-secret redaction.
 
 - `context.Context` owns cancellation and shell/model timeouts.
 - Interfaces keep providers and the tool host testable without network calls.
-- Goroutines and channels replace Python background workers.
-- Concrete structs replace Pydantic models; validation happens at registry and
-  boundary methods.
+- Goroutines and channels provide isolated background workers.
+- Concrete Go structs carry the data contracts; validation happens at registry
+  and boundary methods.
 - The standard library is used throughout, so the runtime builds without
   third-party Go dependencies.
 

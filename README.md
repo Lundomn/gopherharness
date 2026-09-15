@@ -1,17 +1,17 @@
 # GopherHarness｜Go 原生本地编码 Agent 运行时
 
-GopherHarness 是一个使用 Go 构建的本地编码 Agent 运行时。它以 Pico v3 的行为契约为参考，把模型、工具、上下文、记忆、权限、持久化、恢复、工作线程和评测统一在一条可审计的执行链路中。
+GopherHarness 是一个使用 Go 构建的本地编码 Agent 运行时，把模型、工具、上下文、记忆、权限、持久化、恢复、工作线程和评测统一在一条可审计的执行链路中。
 
 它适合希望在本地运行、学习和扩展 AI 编程 Agent 的开发者：模型负责理解和规划，GopherHarness 负责安全地执行、记录和验证结果。
 
-本仓库是独立的 Go 实现，不依赖本地 Python 项目路径。Python v3 仅作为行为参考，便于进行 parity 和 golden contract 校验。
+本仓库是独立、可直接运行的 Go 项目，不依赖其他语言版本或本地路径。
 
 > 本 README 面向中文读者；命令、配置字段和技术名词保留英文，便于直接复制和检索。
 
 ## 项目能力
 
 - 支持 OpenAI-compatible Responses 和 Anthropic-compatible Messages provider。
-- 兼容 Pico 文本协议：`<tool>...</tool>` 与 `<final>...</final>`。
+- 支持标准文本协议：`<tool>...</tool>` 与 `<final>...</final>`。
 - 完整的 turn 状态机，包含重试、步数、重复调用和取消边界。
 - 文件读写、搜索、Shell、图片检查、Todo、计划模式、用户提问和 Worker 生命周期等工具。
 - 工作区与符号链接越界保护、写入前 fresh-read、审批模式和破坏性 Shell 检查。
@@ -20,7 +20,7 @@ GopherHarness 是一个使用 Go 构建的本地编码 Agent 运行时。它以 
 - Checkpoint、Session、事件 JSONL、运行轨迹、报告和长输出 artifact 全部落盘到 `.pico/`。
 - 隔离的 goroutine Worker，支持取消和实时消息队列。
 - 支持从 `SKILL.md` 发现项目级和用户级 Skills。
-- 提供纯 REPL、流式 ANSI TUI、Python v3/Go golden contract 和运行时回归评测。
+- 提供纯 REPL、流式 ANSI TUI、Go golden contract 和运行时回归评测。
 - 最终答案治理、递归证据脱敏、校验后的 checkpoint 恢复和确定性的 Worker 关闭。
 
 ## 环境要求
@@ -114,7 +114,7 @@ REPL/TUI 常用命令：
 
 ## 评测
 
-benchmark schema 参考 Python 项目的任务结构：fixture repo、prompt、允许的工具、步数预算、预期 artifact 和 verifier 命令。
+benchmark schema 使用 fixture repo、prompt、允许的工具、步数预算、预期 artifact 和 verifier 命令。
 
 ```bash
 ./bin/gopherharness-eval \
@@ -140,4 +140,4 @@ make contract
 make build
 ```
 
-架构和学习资料：[请求链路](docs/REQUEST_FLOW.md)、[系统架构](docs/ARCHITECTURE.md)、[Python v3 到 Go 的 parity map](docs/PARITY.md) 和 [Go 学习路径](docs/LEARNING.md)。
+架构和学习资料：[请求链路](docs/REQUEST_FLOW.md)、[系统架构](docs/ARCHITECTURE.md) 和 [Go 学习路径](docs/LEARNING.md)。

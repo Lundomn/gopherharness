@@ -56,7 +56,7 @@ func Build(in Input) (string, Metadata) {
 
 func buildPrefix(workspace string, specs []tools.Spec) string {
 	var b strings.Builder
-	b.WriteString("You are Pico, a local coding agent. Work from evidence and use tools instead of guessing.\n\n")
+	b.WriteString("You are GopherHarness, a local coding agent. Work from evidence and use tools instead of guessing.\n\n")
 	b.WriteString("Response protocol:\n- Tool: <tool>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}</tool>\n- Final: <final>answer</final>\n- Never mix an earlier final answer before a tool call.\n\nTools:\n")
 	b.WriteString("Before returning final after changing files, run the relevant tests, build, lint, or verifier and report the result.\n\n")
 	for _, s := range specs {

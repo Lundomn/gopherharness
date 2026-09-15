@@ -16,7 +16,7 @@ check:
 	go test -race ./...
 
 contract:
-	PICO_PYTHON_ROOT=/Users/ljy/Documents/pico /Users/ljy/Documents/pico/.venv/bin/python scripts/cross_language_contract.py --go-command "go run ./cmd/gopherharness-contract"
+	go test ./internal/protocol -run TestGoldenModelOutputContract -count=1
 
 benchmark:
 	go run ./cmd/gopherharness-eval --offline --benchmark benchmarks/benchmark.json --fixtures benchmarks --workspaces artifacts/go-workspaces --artifact artifacts/go-benchmark.json
