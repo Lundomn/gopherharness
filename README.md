@@ -17,7 +17,7 @@ GopherHarness 是一个使用 Go 构建的本地编码 Agent 运行时，把模�
 - 工作区与符号链接越界保护、写入前 fresh-read、审批模式和破坏性 Shell 检查。
 - 支持 Linux Bubblewrap 和 macOS `sandbox-exec` 隔离后端。
 - 工作记忆、文件摘要、相关笔记召回、持久事实晋升和受控 dream consolidation。
-- Checkpoint、Session、事件 JSONL、运行轨迹、报告和长输出 artifact 全部落盘到 `.pico/`。
+- Checkpoint、Session、事件 JSONL、运行轨迹、报告和长输出 artifact 全部落盘到本地运行时数据目录。
 - 隔离的 goroutine Worker，支持取消和实时消息队列。
 - 支持从 `SKILL.md` 发现项目级和用户级 Skills。
 - 提供纯 REPL、流式 ANSI TUI、Go golden contract 和运行时回归评测。
@@ -47,7 +47,7 @@ bin/gopherharness-contract
 
 ## 配置 provider
 
-复制 `.pico.toml.example` 为 `.pico.toml`，只填写你实际使用的 provider；`.pico.toml` 已被 Git 忽略。
+复制示例配置文件为项目配置文件，只填写你实际使用的 provider；本地配置文件已被 Git 忽略。
 
 ```toml
 provider = "deepseek"
@@ -62,7 +62,7 @@ model = "deepseek-v4-pro"
 配置优先级为：
 
 ```text
-CLI 参数 > 环境变量 > 项目 .pico.toml > 默认值
+CLI 参数 > 环境变量 > 项目配置文件 > 默认值
 ```
 
 ## 运行
