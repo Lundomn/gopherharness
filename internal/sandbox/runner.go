@@ -71,11 +71,25 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 		cmd = exec.CommandContext(ctx, "/bin/sh", "-lc", command)
 		cmd.Dir = cwd
 	}
+	configureProcessGroup(cmd)
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err = cmd.Run()
+	if err = cmd.Start(); err != nil {
+		return Result{}, err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err = <-done:
+	case <-ctx.Done():
+		// CommandContext only terminates the shell process. Kill the process
+		// group as well so children cannot keep stdout/stderr pipes open and
+		// delay timeout reporting.
+		killProcessGroup(cmd)
+		err = <-done
+	}
 	result := Result{Stdout: stdout.String(), Stderr: stderr.String(), Backend: backend}
 	if err != nil {
 		if ctx.Err() != nil {
