@@ -3,3 +3,6 @@
 /.pico/
 /.pico.toml
 *.log
+.env
+.env.*
+!.env.example

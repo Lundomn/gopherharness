@@ -3,6 +3,7 @@ package runtime
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,10 +11,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Lundomn/gopherharness/internal/config"
+	"github.com/Lundomn/gopherharness/internal/contextbuilder"
 	"github.com/Lundomn/gopherharness/internal/governance"
+	"github.com/Lundomn/gopherharness/internal/mcpbridge"
 	"github.com/Lundomn/gopherharness/internal/memory"
 	"github.com/Lundomn/gopherharness/internal/model"
 	"github.com/Lundomn/gopherharness/internal/permission"
@@ -29,31 +33,49 @@ import (
 )
 
 type Options struct {
-	Root             string
-	Config           config.Config
-	Provider         provider.Client
-	Vision           provider.VisionClient
-	Resume           string
-	Approval         permission.Policy
-	Approver         permission.Approver
-	MaxSteps         int
-	MaxAttempts      int
-	MaxNewTokens     int
-	PromptBudget     int
-	Sandbox          sandbox.Config
-	AllowedTools     []string
-	Secrets          []string
-	FinalReadiness   governance.Mode
-	DisableAutoDream bool
-	DreamInterval    time.Duration
-	DreamMinSessions int
-	Input            io.Reader
-	Output           io.Writer
-	OnModelStart     func()
-	OnDelta          func(string) error
+	FallbackClients      []provider.Client
+	ProviderRetries      int
+	MemoryUser           string
+	MemoryScope          string
+	FactBackend          memory.Backend
+	EnableFactExtraction bool
+	SharedMemory         *memory.Manager
+	SharedTodos          *state.TodoLedger
+	MCPServers           []mcpbridge.Server
+	Prices               map[string]provider.Price
+	HistorySelector      contextbuilder.Selector
+	Root                 string
+	Config               config.Config
+	Provider             provider.Client
+	Vision               provider.VisionClient
+	Resume               string
+	Approval             permission.Policy
+	Approver             permission.Approver
+	MaxSteps             int
+	MaxAttempts          int
+	MaxNewTokens         int
+	PromptBudget         int
+	Sandbox              sandbox.Config
+	AllowedTools         []string
+	Secrets              []string
+	FinalReadiness       governance.Mode
+	DisableAutoDream     bool
+	DreamInterval        time.Duration
+	DreamMinSessions     int
+	Input                io.Reader
+	Output               io.Writer
+	OnModelStart         func()
+	OnDelta              func(string) error
 }
 
 type Agent struct {
+	Facts            memory.Backend
+	FactScope        memory.Scope
+	MCP              *mcpbridge.Manager
+	CallLedger       *provider.Ledger
+	ownsLedger       bool
+	traceLost        atomic.Uint64
+	HistorySelector  contextbuilder.Selector
 	Workspace        *workspace.Workspace
 	Provider         provider.Client
 	Vision           provider.VisionClient
@@ -83,15 +105,17 @@ type Agent struct {
 	OnModelStart     func()
 	OnDelta          func(string) error
 	Inbox            <-chan string
-	mu               sync.Mutex
-	lastRun          string
-	usageInput       int
-	usageOutput      int
-	modelCalls       int
-	dreamWG          sync.WaitGroup
-	dreamErrMu       sync.Mutex
-	lastDreamErr     error
-	ResumeStatus     string
+	// DrainInjected is called only before assembling the next model request.
+	DrainInjected func() []string
+	mu            sync.Mutex
+	lastRun       string
+	usageInput    int
+	usageOutput   int
+	modelCalls    int
+	dreamWG       sync.WaitGroup
+	dreamErrMu    sync.Mutex
+	lastDreamErr  error
+	ResumeStatus  string
 }
 
 func New(opts Options) (*Agent, error) {
@@ -112,6 +136,7 @@ func New(opts Options) (*Agent, error) {
 			return nil, err
 		}
 	}
+	visionProvided := opts.Vision != nil
 	if opts.Vision == nil {
 		opts.Vision, _ = opts.Provider.(provider.VisionClient)
 	}
@@ -174,9 +199,12 @@ func New(opts Options) (*Agent, error) {
 	} else {
 		session = sessions.New(w.Root)
 	}
-	mem, err := memory.Open(w.Root)
-	if err != nil {
-		return nil, err
+	mem := opts.SharedMemory
+	if mem == nil {
+		mem, err = memory.OpenScoped(w.Root, session.ID+opts.MemoryScope)
+		if err != nil {
+			return nil, err
+		}
 	}
 	if resumeStatus == model.ResumeFull && resumeCheckpoint != nil {
 		mem.SetGoal(resumeCheckpoint.Goal)
@@ -191,8 +219,80 @@ func New(opts Options) (*Agent, error) {
 		a.allowedTools[name] = true
 	}
 	a.Workers = worker.New(a.runWorker)
+	if opts.SharedTodos != nil {
+		a.Todos = opts.SharedTodos
+	}
+	a.HistorySelector = opts.HistorySelector
+	// One shared wrapper covers main calls, vision, workers and Dream. Child
+	// agents borrow it and never close the parent's ledger.
+	if metered, ok := a.Provider.(*provider.Metered); ok {
+		a.CallLedger = metered.Ledger
+	} else {
+		ledger, ledgerErr := provider.OpenLedger(filepath.Join(w.Root, ".pico", "telemetry", session.ID+".calls.jsonl"), 256)
+		if ledgerErr != nil {
+			return nil, ledgerErr
+		}
+		a.CallLedger = ledger
+		a.ownsLedger = true
+		wrapped := provider.Meter(a.Provider, ledger, opts.Prices)
+		a.Provider = wrapped
+		if !visionProvided && a.Vision != nil {
+			a.Vision = wrapped
+		}
+		if visionProvided {
+			if client, ok := opts.Vision.(provider.Client); ok {
+				a.Vision = provider.Meter(client, ledger, opts.Prices)
+			}
+		}
+	}
+	a.Facts = opts.FactBackend
+	if opts.ProviderRetries > 0 || len(opts.FallbackClients) > 0 {
+		clients := []provider.Client{a.Provider}
+		for _, c := range opts.FallbackClients {
+			clients = append(clients, provider.Meter(c, a.CallLedger, opts.Prices))
+		}
+		a.Provider = &provider.Resilient{Clients: clients, Retries: min(3, max(0, opts.ProviderRetries)), Delay: 200 * time.Millisecond}
+		if !visionProvided && a.Vision != nil {
+			a.Vision = a.Provider.(provider.VisionClient)
+		}
+	}
+	user := opts.MemoryUser
+	if user == "" {
+		user = "local"
+	}
+	a.FactScope = memory.Scope{Repo: w.Root, User: user}
+	if a.Facts == nil {
+		var extractor memory.Extractor
+		if opts.EnableFactExtraction {
+			extractor = memory.ModelExtractor(func(ctx context.Context, prompt string, n int) (string, error) {
+				c, e := a.Provider.Complete(ctx, prompt, n)
+				return c.Text, e
+			})
+		}
+		a.Facts = memory.OpenBackend(w.Root, extractor)
+	}
 	if err := a.saveSession(); err != nil {
+		if a.ownsLedger {
+			_ = a.CallLedger.Close()
+		}
 		return nil, err
+	}
+	if len(opts.MCPServers) > 0 {
+		if opts.Sandbox.Mode != "" && opts.Sandbox.Mode != "off" {
+			for _, s := range opts.MCPServers {
+				if s.Transport == "stdio" {
+					_ = a.Close()
+					return nil, fmt.Errorf("MCP stdio in sandbox requires a sandbox process transport; refusing host fallback")
+				}
+			}
+		}
+		connectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		a.MCP, err = mcpbridge.Connect(connectCtx, a.Tools, opts.MCPServers)
+		cancel()
+		if err != nil {
+			_ = a.Close()
+			return nil, err
+		}
 	}
 	return a, nil
 }
@@ -205,6 +305,7 @@ func (a *Agent) Ask(ctx context.Context, request string) (string, error) {
 func (a *Agent) SessionID() string      { return a.Session.ID }
 func (a *Agent) LastRunID() string      { return a.lastRun }
 func (a *Agent) Usage() (int, int, int) { return a.usageInput, a.usageOutput, a.modelCalls }
+func (a *Agent) TracingLost() uint64    { return a.traceLost.Load() }
 func (a *Agent) Reset() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -217,7 +318,14 @@ func (a *Agent) Close() error {
 	if a.Workers != nil {
 		a.Workers.Close()
 	}
-	return a.WaitForMemoryMaintenance()
+	dreamErr := a.WaitForMemoryMaintenance()
+	if a.MCP != nil {
+		dreamErr = errors.Join(dreamErr, a.MCP.Close())
+	}
+	if a.CallLedger != nil && a.ownsLedger {
+		return errors.Join(dreamErr, a.CallLedger.Close())
+	}
+	return dreamErr
 }
 
 func (a *Agent) saveSession() error {
@@ -226,6 +334,10 @@ func (a *Agent) saveSession() error {
 	if a.Redactor != nil {
 		for index := range snapshot.Messages {
 			snapshot.Messages[index].Content = a.Redactor.Text(snapshot.Messages[index].Content)
+			snapshot.Messages[index].ToolCalls = append([]model.ToolCall(nil), snapshot.Messages[index].ToolCalls...)
+			for j := range snapshot.Messages[index].ToolCalls {
+				snapshot.Messages[index].ToolCalls[j].Args = a.Redactor.Map(snapshot.Messages[index].ToolCalls[j].Args)
+			}
 		}
 		snapshot.Memory = a.Redactor.Map(a.Session.Memory)
 	}
@@ -242,17 +354,35 @@ func (a *Agent) runWorker(ctx context.Context, role, prompt string, inbox <-chan
 	child.Workers = worker.New(func(context.Context, string, string, <-chan string) (string, error) {
 		return "", fmt.Errorf("nested workers are disabled")
 	})
+	child.Facts, child.FactScope = a.Facts, a.FactScope
+	if mem, err := memory.OpenScoped(a.Workspace.Root, childSession.ID); err == nil {
+		child.Memory = mem
+	} else {
+		return "", err
+	}
+	child.HistorySelector = a.HistorySelector
 	return child.run(ctx, fmt.Sprintf("You are a %s worker. Stay within that role.\n\n%s", role, prompt), true)
 }
 
 func (a *Agent) drainInbox() int {
-	if a.Inbox == nil {
-		return 0
-	}
 	count := 0
+	if a.DrainInjected != nil {
+		for _, message := range a.DrainInjected() {
+			if message = strings.TrimSpace(message); message != "" {
+				a.Session.Messages = append(a.Session.Messages, model.Message{Role: "user", Content: "Follow-up: " + message, CreatedAt: time.Now().UTC()})
+				count++
+			}
+		}
+	}
+	if a.Inbox == nil {
+		return count
+	}
 	for {
 		select {
-		case message := <-a.Inbox:
+		case message, ok := <-a.Inbox:
+			if !ok {
+				return count
+			}
 			message = strings.TrimSpace(message)
 			if message != "" {
 				a.Session.Messages = append(a.Session.Messages, model.Message{Role: "user", Content: "Worker follow-up: " + message, CreatedAt: time.Now().UTC()})
@@ -367,6 +497,9 @@ func (a *Agent) planAllows(call model.ToolCall) error {
 		return nil
 	}
 	if call.Name != "write_file" && call.Name != "patch_file" && call.Name != "run_shell" {
+		if spec, ok := a.Tools.Spec(call.Name); ok && spec.Risky {
+			return fmt.Errorf("plan mode blocks external side effects")
+		}
 		return nil
 	}
 	if call.Name == "run_shell" {

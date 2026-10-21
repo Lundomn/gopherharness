@@ -6,7 +6,7 @@
 2. 阅读 `internal/runtime/engine.go`，跟踪完整的 turn 状态机。
 3. 从 `protocol.Parse` 开始跟踪一次工具调用，直到 `tools.Registry` 的 handler。
 4. 阅读 `workspace.Resolve` 和 fresh-read 测试，理解工作区安全边界。
-5. 阅读 `contextbuilder.Build`，理解 section budget、上下文压缩和当前请求保护。
+5. 阅读 `contextbuilder.BuildChecked`、Curator 和闭包校验，理解字节预算、历史分组及工具结果保护。
 6. 跟踪 `evidence.Recorder` 到 trace、session 和 run JSONL 的递归脱敏。
 7. 分别阅读 memory、plan、todo、worker、skills 和 sandbox 模块。
 8. 阅读 `worker.Manager` 和 auto-dream，理解 goroutine、channel、context、锁和 wait group。
@@ -16,6 +16,9 @@
 12. 运行 race detector，分析跨 worker 共享的数据和锁。
 13. 运行 `make contract`，检查 Go 协议 golden contract。
 14. 使用 `gopherharness-eval` 运行 fixture 和 verifier，理解可复现评测。
+15. 从 `gatewayapp.New` 跟踪加密事件、白名单、会话调度、持久收发与回复路由，运行本地模拟平台测试。
+16. 阅读事实后端的作用域、版本比较、冲突和失效测试，区分引用有效、语义正确与用户确认。
+17. 阅读调用账本和重试策略，区分一次逻辑调用、每次实际请求、未知用量和流式部分成功。
 
 ## 推荐练习
 

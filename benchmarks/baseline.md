@@ -33,4 +33,4 @@ go run ./cmd/gopherharness-eval \
 | 类别 | workspace-read、workspace-search、workspace-write、shell、state、governance、reliability、security、protocol、evidence |
 | 最大任务步数 | 5 |
 
-生成的 JSON artifact 包含每个任务的 attempts、tool steps、verifier 状态、stop reason、预期失败处理、类别统计和耗时。任务 20 是有意设置的负向控制：只有 runtime 以 `step_limit_reached` 停止时才算通过。Runtime ID 和时间戳会在运行时生成，不会作为 source fixture 提交。
+生成的 JSON artifact 包含每个任务的 attempts、tool steps、verifier 状态、run status、stop reason、预期失败处理、类别统计和耗时。普通任务要求 `completed + final_answer_returned`，不能把写对产物但异常终止的运行判通过；缺失、损坏或身份不符的运行报告失败关闭。任务 20 是负向控制：要求 `failed + step_limit_reached`，且仍须通过预算、产物和独立校验。Runtime ID 和时间戳动态生成，不作为 fixture 提交。

@@ -9,7 +9,7 @@ import (
 )
 
 func TestBuildKeepsCurrentRequestUnderPressure(t *testing.T) {
-	history := []model.Message{{Role: "tool", Content: strings.Repeat("old", 5000)}}
+	history := []model.Message{{Role: "user", Content: "initial goal"}, {Role: "user", Content: "old question"}, {Role: "tool", Content: strings.Repeat("old", 5000)}, {Role: "user", Content: "recent question"}, {Role: "user", Content: "current question"}}
 	prompt, meta := Build(Input{Workspace: "workspace", Memory: strings.Repeat("memory", 1000), History: history, UserMessage: "MUST_KEEP", Tools: tools.NewRegistry().Specs(), MaxChars: 6000})
 	if !strings.Contains(prompt, "MUST_KEEP") {
 		t.Fatal("current request was removed")

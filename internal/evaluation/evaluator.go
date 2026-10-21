@@ -15,6 +15,7 @@ import (
 
 	"github.com/Lundomn/gopherharness/internal/config"
 	"github.com/Lundomn/gopherharness/internal/governance"
+	"github.com/Lundomn/gopherharness/internal/model"
 	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/provider"
 	"github.com/Lundomn/gopherharness/internal/runtime"
@@ -51,6 +52,7 @@ type Row struct {
 	ToolSteps          int    `json:"tool_steps"`
 	Attempts           int    `json:"attempts"`
 	StopReason         string `json:"stop_reason,omitempty"`
+	RunStatus          string `json:"run_status,omitempty"`
 	ExpectedStopReason string `json:"expected_stop_reason,omitempty"`
 	ExpectedFailure    bool   `json:"expected_failure,omitempty"`
 	Category           string `json:"category,omitempty"`
@@ -159,17 +161,19 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 	row.RunID = agent.LastRunID()
 	row.DurationMS = time.Since(started).Milliseconds()
 	reportPath := filepath.Join(dst, ".pico", "runs", row.RunID, "report.json")
-	var report struct {
-		ToolSteps  int    `json:"tool_steps"`
-		Attempts   int    `json:"attempts"`
-		StopReason string `json:"stop_reason"`
+	var report model.RunReport
+	data, reportErr := os.ReadFile(reportPath)
+	if reportErr == nil {
+		reportErr = json.Unmarshal(data, &report)
 	}
-	if b, err := os.ReadFile(reportPath); err == nil {
-		_ = json.Unmarshal(b, &report)
+	if reportErr != nil || report.RunID != row.RunID || report.SchemaVersion != model.ArtifactSchema || report.ToolSteps < 0 || report.Attempts < 0 {
+		row.FailureCategory = "invalid_run_report"
+		return row
 	}
 	row.ToolSteps = report.ToolSteps
 	row.Attempts = report.Attempts
 	row.StopReason = report.StopReason
+	row.RunStatus = report.Status
 	row.ExpectedStopReason = task.ExpectedStopReason
 	row.ExpectedFailure = task.ExpectFailure
 	row.Category = task.Category
@@ -202,9 +206,9 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 		row.VerifierStderr = truncateOutput(stderr.String())
 	}
 	if task.ExpectFailure {
-		row.Passed = askErr == nil && row.StopReason == task.ExpectedStopReason && row.VerifierPassed
+		row.Passed = askErr == nil && row.RunStatus == model.StatusFailed && row.StopReason == task.ExpectedStopReason && row.WithinBudget && row.ArtifactExists && row.VerifierPassed
 	} else {
-		row.Passed = askErr == nil && row.WithinBudget && row.ArtifactExists && row.VerifierPassed
+		row.Passed = askErr == nil && row.RunStatus == model.StatusCompleted && row.StopReason == model.StopFinalAnswer && row.WithinBudget && row.ArtifactExists && row.VerifierPassed
 	}
 	if row.Passed {
 		row.Status = "pass"
@@ -220,6 +224,8 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 			row.FailureCategory = "verifier_failed"
 		case task.ExpectFailure && row.StopReason != task.ExpectedStopReason:
 			row.FailureCategory = "unexpected_stop_reason"
+		default:
+			row.FailureCategory = "unexpected_run_outcome"
 		}
 	}
 	return row
@@ -327,6 +333,9 @@ func validateBenchmark(b Benchmark, fixtureRoot string) error {
 		}
 		if task.ExpectFailure && strings.TrimSpace(task.ExpectedStopReason) == "" {
 			return fmt.Errorf("benchmark task %q expected_stop_reason is required for a negative control", id)
+		}
+		if task.ExpectFailure && task.ExpectedStopReason == model.StopFinalAnswer {
+			return fmt.Errorf("benchmark task %q negative control cannot expect a successful final answer", id)
 		}
 	}
 	return nil

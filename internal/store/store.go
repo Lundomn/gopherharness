@@ -112,12 +112,14 @@ func LoadLatestCheckpoint(root, sessionID string) (*model.Checkpoint, error) {
 		}
 		dir := filepath.Join(runsDir, entry.Name())
 		var report model.RunReport
-		if readJSON(filepath.Join(dir, "report.json"), &report) != nil || report.SessionID != sessionID {
-			continue
-		}
 		var checkpoint model.Checkpoint
 		if readJSON(filepath.Join(dir, "checkpoint.json"), &checkpoint) == nil {
-			return &checkpoint, nil
+			if checkpoint.SessionID == sessionID {
+				return &checkpoint, nil
+			}
+			if checkpoint.SessionID == "" && readJSON(filepath.Join(dir, "report.json"), &report) == nil && report.SessionID == sessionID {
+				return &checkpoint, nil
+			}
 		}
 	}
 	return nil, os.ErrNotExist

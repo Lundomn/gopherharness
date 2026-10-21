@@ -251,7 +251,7 @@
         "<tool>{\"name\":\"read_file\",\"args\":{\"path\":\"README.md\"}}</tool>",
         "<final>Decision: benchmark checkpoint is persisted</final>"
       ],
-      "verifier": "grep -q 'README.md' .pico/memory/working.json && test -f .pico/memory/topics/project.md && test -f .pico/runs/*/checkpoint.json"
+      "verifier": "grep -q 'README.md' .pico/memory/working-*.json && test -f .pico/memory/topics/project.md && test -f .pico/runs/*/checkpoint.json"
     },
     {
       "id": "19-memory-redaction",
@@ -275,6 +275,7 @@
       "expect_failure": true,
       "expected_stop_reason": "step_limit_reached",
       "responses": [
+        "<tool>{\"name\":\"list_files\",\"args\":{\"path\":\".\"}}</tool>",
         "<tool>{\"name\":\"list_files\",\"args\":{\"path\":\".\"}}</tool>",
         "<tool>{\"name\":\"list_files\",\"args\":{\"path\":\".\"}}</tool>"
       ],

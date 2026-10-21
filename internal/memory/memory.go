@@ -38,7 +38,13 @@ type Manager struct {
 }
 
 func Open(root string) (*Manager, error) {
-	m := &Manager{root: root, path: filepath.Join(root, ".pico", "memory", "working.json"), state: State{FileSummaries: map[string]FileSummary{}}}
+	return openPath(root, filepath.Join(root, ".pico", "memory", "working.json"))
+}
+func OpenScoped(root, scope string) (*Manager, error) {
+	return openPath(root, filepath.Join(root, ".pico", "memory", "working-"+digest(scope)+".json"))
+}
+func openPath(root, path string) (*Manager, error) {
+	m := &Manager{root: root, path: path, state: State{FileSummaries: map[string]FileSummary{}}}
 	if b, err := os.ReadFile(m.path); err == nil {
 		if err = json.Unmarshal(b, &m.state); err != nil {
 			return nil, err

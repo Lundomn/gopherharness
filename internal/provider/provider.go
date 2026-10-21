@@ -8,13 +8,18 @@ import (
 )
 
 type Usage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
+	InputTokens      int `json:"input_tokens"`
+	OutputTokens     int `json:"output_tokens"`
+	CacheReadTokens  int `json:"cache_read_tokens"`
+	CacheWriteTokens int `json:"cache_write_tokens"`
+	// InputTokens is normalized fresh input, excluding cached reads/writes.
+	Complete bool `json:"complete"`
 }
 
 type Completion struct {
-	Text  string `json:"text"`
-	Usage Usage  `json:"usage"`
+	Text        string `json:"text"`
+	Usage       Usage  `json:"usage"`
+	ActualModel string `json:"actual_model,omitempty"`
 }
 
 type Client interface {

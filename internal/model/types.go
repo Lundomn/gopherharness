@@ -9,6 +9,7 @@ const (
 
 	StopFinalAnswer  = "final_answer_returned"
 	StopStepLimit    = "step_limit_reached"
+	StopAttemptLimit = "attempt_limit_reached"
 	StopRetryLimit   = "retry_limit_reached"
 	StopModelError   = "model_error"
 	StopApproval     = "approval_denied"
@@ -24,6 +25,7 @@ const (
 )
 
 type ToolCall struct {
+	ID   string         `json:"id,omitempty"`
 	Name string         `json:"name"`
 	Args map[string]any `json:"args"`
 }
@@ -39,9 +41,12 @@ type ToolResult struct {
 }
 
 type Message struct {
-	Role      string    `json:"role"`
-	Content   string    `json:"content"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string     `json:"id,omitempty"`
+	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	CreatedAt  time.Time  `json:"created_at"`
 }
 
 type TaskState struct {
@@ -101,6 +106,7 @@ type Session struct {
 }
 
 type Checkpoint struct {
+	SessionID     string            `json:"session_id,omitempty"`
 	SchemaVersion string            `json:"schema_version"`
 	ID            string            `json:"id"`
 	RunID         string            `json:"run_id"`

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,14 +38,12 @@ func timeout(seconds int) *http.Client {
 type openAIClient struct{ httpClient }
 
 type openAIResponse struct {
+	Model      string `json:"model"`
 	OutputText string `json:"output_text"`
 	Output     []struct {
 		Content []struct{ Type, Text string } `json:"content"`
 	} `json:"output"`
-	Usage struct {
-		Input  int `json:"input_tokens"`
-		Output int `json:"output_tokens"`
-	} `json:"usage"`
+	Usage WireUsage `json:"usage"`
 }
 
 func (c *openAIClient) Name() string  { return c.profile.Name }
@@ -77,10 +76,8 @@ func (c *openAIClient) Stream(ctx context.Context, prompt string, maxTokens int,
 			Type     string `json:"type"`
 			Delta    string `json:"delta"`
 			Response struct {
-				Usage struct {
-					Input  int `json:"input_tokens"`
-					Output int `json:"output_tokens"`
-				} `json:"usage"`
+				Usage WireUsage `json:"usage"`
+				Model string    `json:"model"`
 			} `json:"response"`
 		}
 		if err := json.Unmarshal(data, &event); err != nil {
@@ -91,7 +88,8 @@ func (c *openAIClient) Stream(ctx context.Context, prompt string, maxTokens int,
 			return onDelta(event.Delta)
 		}
 		if event.Type == "response.completed" {
-			result.Usage = Usage{InputTokens: event.Response.Usage.Input, OutputTokens: event.Response.Usage.Output}
+			result.Usage = event.Response.Usage.Normalized(true)
+			result.ActualModel = event.Response.Model
 		}
 		return nil
 	})
@@ -107,7 +105,7 @@ func openAICompletion(payload openAIResponse) Completion {
 			}
 		}
 	}
-	return Completion{Text: text, Usage: Usage{InputTokens: payload.Usage.Input, OutputTokens: payload.Usage.Output}}
+	return Completion{Text: text, Usage: payload.Usage.Normalized(true), ActualModel: payload.Model}
 }
 
 type anthropicClient struct{ httpClient }
@@ -118,10 +116,8 @@ func (c *anthropicClient) Complete(ctx context.Context, prompt string, maxTokens
 	body := map[string]any{"model": c.profile.Model, "max_tokens": maxTokens, "messages": []map[string]string{{"role": "user", "content": prompt}}}
 	var payload struct {
 		Content []struct{ Type, Text string } `json:"content"`
-		Usage   struct {
-			Input  int `json:"input_tokens"`
-			Output int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage   WireUsage                     `json:"usage"`
+		Model   string                        `json:"model"`
 	}
 	headers := map[string]string{"x-api-key": c.profile.APIKey, "anthropic-version": "2023-06-01"}
 	if err := c.do(ctx, "/messages", body, headers, &payload); err != nil {
@@ -133,7 +129,7 @@ func (c *anthropicClient) Complete(ctx context.Context, prompt string, maxTokens
 			b.WriteString(block.Text)
 		}
 	}
-	return Completion{Text: b.String(), Usage: Usage{InputTokens: payload.Usage.Input, OutputTokens: payload.Usage.Output}}, nil
+	return Completion{Text: b.String(), Usage: payload.Usage.Normalized(false), ActualModel: payload.Model}, nil
 }
 
 func (c *anthropicClient) InspectImage(ctx context.Context, mime string, data []byte, prompt string, maxTokens int) (Completion, error) {
@@ -144,10 +140,8 @@ func (c *anthropicClient) InspectImage(ctx context.Context, mime string, data []
 	body := map[string]any{"model": c.profile.Model, "max_tokens": maxTokens, "messages": []map[string]any{{"role": "user", "content": content}}}
 	var payload struct {
 		Content []struct{ Type, Text string } `json:"content"`
-		Usage   struct {
-			Input  int `json:"input_tokens"`
-			Output int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage   WireUsage                     `json:"usage"`
+		Model   string                        `json:"model"`
 	}
 	headers := map[string]string{"x-api-key": c.profile.APIKey, "anthropic-version": "2023-06-01"}
 	if err := c.do(ctx, "/messages", body, headers, &payload); err != nil {
@@ -157,13 +151,14 @@ func (c *anthropicClient) InspectImage(ctx context.Context, mime string, data []
 	for _, block := range payload.Content {
 		b.WriteString(block.Text)
 	}
-	return Completion{Text: b.String(), Usage: Usage{InputTokens: payload.Usage.Input, OutputTokens: payload.Usage.Output}}, nil
+	return Completion{Text: b.String(), Usage: payload.Usage.Normalized(false), ActualModel: payload.Model}, nil
 }
 
 func (c *anthropicClient) Stream(ctx context.Context, prompt string, maxTokens int, onDelta func(string) error) (Completion, error) {
 	body := map[string]any{"model": c.profile.Model, "max_tokens": maxTokens, "stream": true, "messages": []map[string]string{{"role": "user", "content": prompt}}}
 	headers := map[string]string{"x-api-key": c.profile.APIKey, "anthropic-version": "2023-06-01"}
 	var result Completion
+	var usage WireUsage
 	err := c.stream(ctx, "/messages", body, headers, func(data []byte) error {
 		var event struct {
 			Type  string `json:"type"`
@@ -171,13 +166,10 @@ func (c *anthropicClient) Stream(ctx context.Context, prompt string, maxTokens i
 				Text string `json:"text"`
 			} `json:"delta"`
 			Message struct {
-				Usage struct {
-					Input int `json:"input_tokens"`
-				} `json:"usage"`
+				Usage WireUsage `json:"usage"`
+				Model string    `json:"model"`
 			} `json:"message"`
-			Usage struct {
-				Output int `json:"output_tokens"`
-			} `json:"usage"`
+			Usage WireUsage `json:"usage"`
 		}
 		if err := json.Unmarshal(data, &event); err != nil {
 			return err
@@ -187,11 +179,13 @@ func (c *anthropicClient) Stream(ctx context.Context, prompt string, maxTokens i
 			return onDelta(event.Delta.Text)
 		}
 		if event.Type == "message_start" {
-			result.Usage.InputTokens = event.Message.Usage.Input
+			usage = event.Message.Usage
+			result.ActualModel = event.Message.Model
 		}
 		if event.Type == "message_delta" {
-			result.Usage.OutputTokens = event.Usage.Output
+			usage.Output = event.Usage.Output
 		}
+		result.Usage = usage.Normalized(false)
 		return nil
 	})
 	return result, err
@@ -221,7 +215,7 @@ func (c *httpClient) do(ctx context.Context, endpoint string, body any, headers 
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return fmt.Errorf("provider HTTP %d: %s", resp.StatusCode, redact(string(limited), c.profile.APIKey))
+		return responseError(resp, redact(string(limited), c.profile.APIKey))
 	}
 	if strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
 		return decodeSSE(resp.Body, target)
@@ -254,7 +248,7 @@ func (c *httpClient) stream(ctx context.Context, endpoint string, body any, head
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return fmt.Errorf("provider HTTP %d: %s", resp.StatusCode, redact(string(limited), c.profile.APIKey))
+		return responseError(resp, redact(string(limited), c.profile.APIKey))
 	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
@@ -300,4 +294,13 @@ func redact(s, secret string) string {
 		return s
 	}
 	return strings.ReplaceAll(s, secret, "[REDACTED]")
+}
+func responseError(resp *http.Response, detail string) error {
+	var wait time.Duration
+	if n, e := strconv.Atoi(resp.Header.Get("Retry-After")); e == nil {
+		wait = time.Duration(max(0, n)) * time.Second
+	} else if t, e := http.ParseTime(resp.Header.Get("Retry-After")); e == nil {
+		wait = max(0, time.Until(t))
+	}
+	return &HTTPError{Status: resp.StatusCode, Detail: detail, RetryAfter: wait}
 }

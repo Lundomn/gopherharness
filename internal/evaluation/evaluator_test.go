@@ -107,6 +107,7 @@ func TestEvaluatorAcceptsDeclaredNegativeControl(t *testing.T) {
 		AllowedTools: []string{"list_files"}, StepBudget: 1, ExpectFailure: true,
 		ExpectedStopReason: "step_limit_reached", Responses: []string{
 			`<tool>{"name":"list_files","args":{"path":"."}}</tool>`,
+			`<tool>{"name":"list_files","args":{"path":"."}}</tool>`,
 		}, Verifier: "test -f README.md",
 	}}}
 	raw, err := json.Marshal(benchmark)
@@ -145,5 +146,34 @@ func TestValidateBenchmarkRejectsUnsafeTaskPaths(t *testing.T) {
 				t.Fatal("unsafe benchmark was accepted")
 			}
 		})
+	}
+}
+
+func TestEvaluatorRejectsArtifactFromUnfinishedRun(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "fixture"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	task := Task{ID: "unfinished", Prompt: "write then finish", FixtureRepo: "fixture", StepBudget: 1,
+		AllowedTools: []string{"write_file"}, ExpectedArtifact: "result.txt", Verifier: "test -f result.txt",
+		Responses: []string{`<tool>{"name":"write_file","args":{"path":"result.txt","content":"ok"}}</tool>`, `<tool>{"name":"write_file","args":{"path":"extra.txt","content":"blocked"}}</tool>`}}
+	row := runTask(context.Background(), Options{FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "work"), Config: config.Defaults()}, task)
+	if row.Passed || row.FailureCategory != "unexpected_run_outcome" || !row.ArtifactExists || !row.VerifierPassed || row.StopReason != "step_limit_reached" {
+		t.Fatalf("unfinished task must not pass even with a correct artifact: %+v", row)
+	}
+}
+
+func TestNegativeControlStillRequiresArtifact(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "fixture"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	task := Task{ID: "negative", Prompt: "list", FixtureRepo: "fixture", StepBudget: 1,
+		AllowedTools: []string{"list_files"}, ExpectedArtifact: "missing.txt", Verifier: "true",
+		ExpectFailure: true, ExpectedStopReason: "step_limit_reached",
+		Responses: []string{`<tool>{"name":"list_files","args":{"path":"."}}</tool>`, `<tool>{"name":"list_files","args":{"path":"."}}</tool>`}}
+	row := runTask(context.Background(), Options{FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "work"), Config: config.Defaults()}, task)
+	if row.Passed || row.FailureCategory != "missing_artifact" {
+		t.Fatalf("negative control skipped artifact condition: %+v", row)
 	}
 }

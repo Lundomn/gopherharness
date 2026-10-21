@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 
 	"github.com/Lundomn/gopherharness/internal/config"
 	"github.com/Lundomn/gopherharness/internal/governance"
+	"github.com/Lundomn/gopherharness/internal/mcpbridge"
 	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/provider"
 	"github.com/Lundomn/gopherharness/internal/runtime"
@@ -60,6 +62,7 @@ func Run(args []string, opts Options) int {
 	maxSteps := fs.Int("max-steps", 50, "maximum tool steps")
 	maxTokens := fs.Int("max-new-tokens", 8192, "maximum model output tokens")
 	promptBudget := fs.Int("prompt-budget", 60000, "maximum prompt characters")
+	mcpConfig := fs.String("mcp-config", "", "JSON file containing trusted MCP server definitions")
 	finalReadiness := fs.String("final-readiness", "warn", "final-answer gate: off, warn, soft, or strict")
 	noAutoDream := fs.Bool("no-auto-dream", false, "disable background memory consolidation")
 	dreamInterval := fs.Float64("dream-interval", 24, "minimum hours between automatic dream runs")
@@ -174,6 +177,17 @@ func Run(args []string, opts Options) int {
 		Secrets:          []string{p.APIKey, *visionAPIKey},
 		Input:            opts.Stdin,
 		Output:           opts.Stdout,
+	}
+	if *mcpConfig != "" {
+		data, readErr := os.ReadFile(*mcpConfig)
+		if readErr != nil {
+			return fail(opts.Stderr, readErr)
+		}
+		var servers []mcpbridge.Server
+		if err := json.Unmarshal(data, &servers); err != nil {
+			return fail(opts.Stderr, fmt.Errorf("MCP config: %w", err))
+		}
+		agentOptions.MCPServers = servers
 	}
 	agent, err := runtime.New(agentOptions)
 	if err != nil {

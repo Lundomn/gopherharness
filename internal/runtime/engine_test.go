@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	gostdruntime "runtime"
@@ -40,6 +42,69 @@ func TestAgentRunsToolLoopAndWritesEvidence(t *testing.T) {
 		if !strings.Contains(string(trace), want) {
 			t.Fatalf("trace missing %s", want)
 		}
+	}
+}
+
+func TestToolBudgetAllowsFinalAnswerButNeverAnotherTool(t *testing.T) {
+	for _, final := range []bool{true, false} {
+		t.Run(fmt.Sprint(final), func(t *testing.T) {
+			root := t.TempDir()
+			last := `<tool>{"name":"write_file","args":{"path":"over-budget.txt","content":"no"}}</tool>`
+			if final {
+				last = `<final>done</final>`
+			}
+			fake := &provider.Fake{Responses: []string{`<tool>{"name":"list_files","args":{"path":"."}}</tool>`, last}}
+			a, err := New(Options{Root: root, Config: config.Defaults(), Provider: fake, Approval: permission.Auto, MaxSteps: 1, DisableAutoDream: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer a.Close()
+			answer, err := a.Ask(context.Background(), "list and finish")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var report model.RunReport
+			raw, err := os.ReadFile(filepath.Join(root, ".pico", "runs", a.LastRunID(), "report.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = json.Unmarshal(raw, &report); err != nil {
+				t.Fatal(err)
+			}
+			want := model.StopStepLimit
+			if final {
+				want = model.StopFinalAnswer
+			}
+			if report.StopReason != want || report.ToolSteps != 1 || report.Attempts != 2 {
+				t.Fatalf("report=%+v answer=%s", report, answer)
+			}
+			if _, err := os.Stat(filepath.Join(root, "over-budget.txt")); !os.IsNotExist(err) {
+				t.Fatal("tool ran after budget exhausted")
+			}
+		})
+	}
+}
+
+func TestModelAttemptBudgetHasSeparateStopReason(t *testing.T) {
+	fake := &provider.Fake{Responses: []string{"not a valid protocol"}}
+	a, err := New(Options{Root: t.TempDir(), Config: config.Defaults(), Provider: fake, MaxSteps: 5, MaxAttempts: 1, DisableAutoDream: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer a.Close()
+	if _, err = a.Ask(context.Background(), "finish"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(filepath.Join(a.Workspace.Root, ".pico", "runs", a.LastRunID(), "report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report model.RunReport
+	if err = json.Unmarshal(raw, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.StopReason != model.StopAttemptLimit || report.ToolSteps != 0 {
+		t.Fatalf("report=%+v", report)
 	}
 }
 

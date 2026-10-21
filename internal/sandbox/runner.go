@@ -72,6 +72,8 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 		cmd.Dir = cwd
 	}
 	configureProcessGroup(cmd)
+	cmd.Cancel = func() error { killProcessGroup(cmd); return nil }
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -93,7 +95,10 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 	result := Result{Stdout: stdout.String(), Stderr: stderr.String(), Backend: backend}
 	if err != nil {
 		if ctx.Err() != nil {
-			return result, fmt.Errorf("shell timeout after %ds", seconds)
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return result, fmt.Errorf("shell cancelled: %w", ctx.Err())
+			}
+			return result, fmt.Errorf("shell timeout after %ds: %w", seconds, ctx.Err())
 		}
 		var exit *exec.ExitError
 		if errors.As(err, &exit) {

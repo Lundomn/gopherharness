@@ -14,7 +14,9 @@ import (
 	"strconv"
 	"strings"
 
+	"encoding/json"
 	"github.com/Lundomn/gopherharness/internal/model"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 type Host interface {
@@ -53,14 +55,24 @@ type Definition struct {
 }
 
 type Registry struct {
-	specs    map[string]Spec
-	handlers map[string]Handler
+	specs        map[string]Spec
+	handlers     map[string]Handler
+	capabilities map[string]Capability
+	validators   map[string]*jsonschema.Resolved
 }
 
 func NewRegistry() *Registry {
 	r := &Registry{specs: map[string]Spec{}, handlers: map[string]Handler{}}
 	for _, definition := range builtinDefinitions() {
 		_ = r.Register(definition)
+		switch definition.Spec.Name {
+		case "read_file", "list_files", "search":
+			r.capabilities[definition.Spec.Name] = Capability{Effect: Read, ConcurrencySafe: true}
+		case "write_file", "patch_file":
+			r.capabilities[definition.Spec.Name] = Capability{Effect: Write}
+		case "run_shell":
+			r.capabilities[definition.Spec.Name] = Capability{Effect: Execute}
+		}
 	}
 	return r
 }
@@ -74,8 +86,20 @@ func (r *Registry) Register(definition Definition) error {
 		return fmt.Errorf("tool %q is already registered", name)
 	}
 	definition.Spec.Name = name
+	validator, err := compileSchema(definition.Spec.Schema)
+	if err != nil {
+		return fmt.Errorf("tool %s schema: %w", name, err)
+	}
+	if r.validators == nil {
+		r.validators = map[string]*jsonschema.Resolved{}
+	}
 	r.specs[name] = definition.Spec
 	r.handlers[name] = definition.Handler
+	if r.capabilities == nil {
+		r.capabilities = map[string]Capability{}
+	}
+	r.capabilities[name] = Capability{Effect: Unknown}
+	r.validators[name] = validator
 	return nil
 }
 
@@ -149,6 +173,26 @@ func (r *Registry) Run(ctx context.Context, h Host, call model.ToolCall) model.T
 		result.Error = fmt.Sprintf("unknown tool %q", call.Name)
 		result.ErrorCode = "unknown_tool"
 		return result
+	}
+	if validator := r.validators[call.Name]; validator != nil {
+		args := call.Args
+		if args == nil {
+			args = map[string]any{}
+		}
+		data, err := json.Marshal(args)
+		var normalized any
+		if err == nil {
+			err = json.Unmarshal(data, &normalized)
+		}
+		if err == nil {
+			err = validator.Validate(normalized)
+		}
+		if err != nil {
+			result.Status = "error"
+			result.Error = err.Error()
+			result.ErrorCode = "invalid_parameters"
+			return result
+		}
 	}
 	output, paths, err := handler(ctx, h, call.Args)
 	if err != nil {
