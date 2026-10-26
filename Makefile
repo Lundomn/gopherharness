@@ -7,6 +7,8 @@ build:
 	go build -o bin/gopherharness-eval ./cmd/gopherharness-eval
 	go build -o bin/gopherharness-contract ./cmd/gopherharness-contract
 	go build -o bin/gopherharness-gateway ./cmd/gopherharness-gateway
+	go build -o bin/gopherharness-loadtest ./cmd/gopherharness-loadtest
+	go build -o bin/gopherharness-maintain ./cmd/gopherharness-maintain
 
 test:
 	go test ./...
@@ -25,10 +27,10 @@ contract:
 	go test ./internal/protocol -run TestGoldenModelOutputContract -count=1
 
 benchmark:
-	go run ./cmd/gopherharness-eval --offline --benchmark benchmarks/benchmark.json --fixtures benchmarks --workspaces artifacts/go-workspaces --artifact artifacts/go-benchmark.json
+	go run ./cmd/gopherharness-eval --offline --allow-host-verifier --benchmark benchmarks/benchmark.json --fixtures benchmarks --workspaces artifacts/go-workspaces --artifact artifacts/go-benchmark.json
 
 install:
-	go install ./cmd/gopherharness ./cmd/gopherharness-tui ./cmd/gopherharness-eval ./cmd/gopherharness-contract ./cmd/gopherharness-gateway
+	go install ./cmd/gopherharness ./cmd/gopherharness-tui ./cmd/gopherharness-eval ./cmd/gopherharness-contract ./cmd/gopherharness-gateway ./cmd/gopherharness-loadtest ./cmd/gopherharness-maintain
 
 clean:
 	go clean

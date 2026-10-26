@@ -32,7 +32,7 @@ func TestPerOutletIsolationRetryAndTrace(t *testing.T) {
 		if tries == 1 {
 			close(started)
 			<-blocked
-			return Receipt{}, errors.New("temporary")
+			return Receipt{}, RejectedError{errors.New("temporary rejection before send")}
 		}
 		return Receipt{MessageID: "a"}, nil
 	}))
@@ -79,5 +79,46 @@ func TestTerminalFailureNotRetriedAndNoOutletRejected(t *testing.T) {
 	}
 	if err := h.Close(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestUnknownNonIdempotentOutcomeIsNotRetriedWithoutJournal(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	var calls int
+	records := make(chan Record, 1)
+	h := New(1, 3, 0, time.Second, func(r Record) { records <- r })
+	_ = h.Register("x", outletFunc(func(context.Context, Message) (Receipt, error) {
+		calls++
+		return Receipt{}, errors.New("response lost after send")
+	}))
+	_ = h.Post(ctx, Message{ID: "stable", Source: scheduler.Source{Channel: "x", ChatID: "chat"}})
+	if err := h.WaitIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r := <-records
+	if calls != 1 || r.Outcome != "unknown" {
+		t.Fatal(calls, r)
+	}
+}
+
+func TestOutletPanicSettlesPendingWithoutClaimingFailureOrSuccess(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	records := make(chan Record, 1)
+	h := New(1, 3, 0, time.Second, func(r Record) { records <- r })
+	_ = h.Register("x", outletFunc(func(context.Context, Message) (Receipt, error) { panic("adapter bug") }))
+	_ = h.Post(ctx, Message{ID: "id", Source: scheduler.Source{Channel: "x", ChatID: "chat"}})
+	if err := h.WaitIdle(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r := <-records; r.Outcome != "unknown" || r.Attempts != 1 {
+		t.Fatal(r)
 	}
 }

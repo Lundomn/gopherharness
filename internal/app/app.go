@@ -17,6 +17,7 @@ import (
 
 	"github.com/Lundomn/gopherharness/internal/config"
 	"github.com/Lundomn/gopherharness/internal/governance"
+	"github.com/Lundomn/gopherharness/internal/maintenance"
 	"github.com/Lundomn/gopherharness/internal/mcpbridge"
 	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/provider"
@@ -59,9 +60,21 @@ func Run(args []string, opts Options) int {
 	visionTimeout := fs.Int("vision-timeout", 120, "vision request timeout in seconds")
 	resume := fs.String("resume", "", "session id or latest")
 	approval := fs.String("approval", "ask", "ask, auto, or never")
+	asyncApproval := fs.Bool("async-approval", false, "persist pending approval and release the running turn")
+	workerWrites := fs.Bool("allow-worker-writes", false, "allow child agents to modify files; requires --approval auto")
+	approveID := fs.String("approve", "", "approve and resume a pending action; requires --resume")
+	denyID := fs.String("deny", "", "deny and resume a pending action; requires --resume")
+	activeCandidate := fs.Bool("active-candidate", false, "use the explicitly activated and verified maintenance worktree")
 	maxSteps := fs.Int("max-steps", 50, "maximum tool steps")
-	maxTokens := fs.Int("max-new-tokens", 8192, "maximum model output tokens")
-	promptBudget := fs.Int("prompt-budget", 60000, "maximum prompt characters")
+	maxIterations := fs.Int("max-iterations", 0, "maximum model iterations (profile default: 40)")
+	providerRetries := fs.Int("provider-retries", -1, "transient retries per provider, 0..3 (-1 uses config)")
+	fallbackProviders := fs.String("fallback-providers", "", "comma-separated fallback profile names")
+	costLimit := fs.Int64("cost-limit-nanousd", -1, "shared persistent session budget, USD * 1e9 (0 disables; -1 uses config)")
+	maxTokens := fs.Int("max-new-tokens", 0, "maximum output tokens (profile default: 8192)")
+	promptBudget := fs.Int("prompt-budget", 0, "optional additional prompt byte ceiling (0 disables; token budget always enforced)")
+	contextWindow := fs.Int("context-window-tokens", 0, "model window tokens (profile default: 65536)")
+	contextTokenizer := fs.String("context-tokenizer", "", "cl100k_base (default) or o200k_base local estimator")
+	historySelection := fs.String("history-selector", "model", "history scoring: model or rule")
 	mcpConfig := fs.String("mcp-config", "", "JSON file containing trusted MCP server definitions")
 	finalReadiness := fs.String("final-readiness", "warn", "final-answer gate: off, warn, soft, or strict")
 	noAutoDream := fs.Bool("no-auto-dream", false, "disable background memory consolidation")
@@ -69,6 +82,10 @@ func Run(args []string, opts Options) int {
 	dreamMinSessions := fs.Int("dream-min-sessions", 5, "minimum sessions before automatic dream")
 	sandboxMode := fs.String("sandbox", "off", "off, best_effort, or required")
 	sandboxBackend := fs.String("sandbox-backend", "auto", "auto, bubblewrap, sandbox-exec, or none")
+	denyNetwork := fs.Bool("deny-network", false, "deny shell networking; requires OS sandbox")
+	noPersonalSkills := fs.Bool("no-personal-skills", false, "load project skills only")
+	memoryURL := fs.String("memory-url", "", "Memory JSON v1 backend URL")
+	extractFacts := fs.Bool("extract-facts", false, "enable model-based extraction for local long-term memory")
 	tui := fs.Bool("tui", opts.ForceTUI, "launch terminal UI")
 	repl := fs.Bool("repl", false, "launch plain REPL")
 	nonInteractive := fs.Bool("non-interactive", false, "disable interactive approval")
@@ -92,10 +109,36 @@ func Run(args []string, opts Options) int {
 	if err != nil {
 		return fail(opts.Stderr, err)
 	}
+	if *activeCandidate {
+		abs, err = maintenance.ResolveActiveRoot(context.Background(), abs)
+		if err != nil {
+			return fail(opts.Stderr, err)
+		}
+	}
+	if (*approveID != "" && *denyID != "") || ((*approveID != "" || *denyID != "") && (*resume == "" || len(fs.Args()) > 0)) {
+		return fail(opts.Stderr, fmt.Errorf("use either --approve or --deny with --resume and no new prompt"))
+	}
 	cfg, err := config.Load(abs, *configPath)
 	if err != nil {
 		return fail(opts.Stderr, fmt.Errorf("config: %w", err))
 	}
+	if *providerRetries < -1 || *providerRetries > 3 || *costLimit < -1 || *maxIterations < 0 || *maxIterations > 1000 {
+		return fail(opts.Stderr, fmt.Errorf("invalid retry, budget or iteration limit"))
+	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "sandbox":
+			cfg.Sandbox.Mode = *sandboxMode
+		case "sandbox-backend":
+			cfg.Sandbox.Backend = *sandboxBackend
+		case "deny-network":
+			cfg.Sandbox.DenyNetwork = *denyNetwork
+		case "memory-url":
+			cfg.Memory.BaseURL = *memoryURL
+		case "extract-facts":
+			cfg.Memory.ExtractFacts = *extractFacts
+		}
+	})
 	if *providerName != "" {
 		cfg.Provider = strings.ToLower(*providerName)
 	}
@@ -113,6 +156,25 @@ func Run(args []string, opts Options) int {
 		p.BaseURL = *baseURL
 	}
 	cfg.Providers[cfg.Provider] = p
+	if *providerRetries >= 0 {
+		cfg.Runtime.ProviderRetries = *providerRetries
+	}
+	if *costLimit >= 0 {
+		cfg.Runtime.CostLimitNanoUSD = *costLimit
+	}
+	if *maxIterations != 0 {
+		cfg.Runtime.MaxIterations = *maxIterations
+	}
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "fallback-providers" {
+			cfg.Runtime.FallbackProviders = nil
+			for _, name := range strings.Split(*fallbackProviders, ",") {
+				if name = strings.TrimSpace(name); name != "" {
+					cfg.Runtime.FallbackProviders = append(cfg.Runtime.FallbackProviders, name)
+				}
+			}
+		}
+	})
 	client, err := provider.New(p, 300)
 	if err != nil {
 		return fail(opts.Stderr, err)
@@ -159,24 +221,31 @@ func Run(args []string, opts Options) int {
 		approver = permission.TerminalApprover{In: opts.Stdin, Out: opts.Stdout}
 	}
 	agentOptions := runtime.Options{
-		Root:             abs,
-		Config:           cfg,
-		Provider:         client,
-		Vision:           vision,
-		Resume:           *resume,
-		Approval:         policy,
-		Approver:         approver,
-		MaxSteps:         *maxSteps,
-		MaxNewTokens:     *maxTokens,
-		PromptBudget:     *promptBudget,
-		FinalReadiness:   readinessMode,
-		Sandbox:          sandbox.Config{Mode: *sandboxMode, Backend: *sandboxBackend, WorkspaceWrite: cfg.Sandbox.WorkspaceWrite},
-		DisableAutoDream: *noAutoDream,
-		DreamInterval:    time.Duration(*dreamInterval * float64(time.Hour)),
-		DreamMinSessions: *dreamMinSessions,
-		Secrets:          []string{p.APIKey, *visionAPIKey},
-		Input:            opts.Stdin,
-		Output:           opts.Stdout,
+		Root:                  abs,
+		Config:                cfg,
+		Provider:              client,
+		Vision:                vision,
+		Resume:                *resume,
+		Approval:              policy,
+		Approver:              approver,
+		AsyncApproval:         *asyncApproval,
+		AllowWorkerWrites:     *workerWrites,
+		MaxSteps:              *maxSteps,
+		MaxAttempts:           cfg.Runtime.MaxIterations,
+		MaxNewTokens:          *maxTokens,
+		PromptBudget:          *promptBudget,
+		ContextWindowTokens:   *contextWindow,
+		Tokenizer:             *contextTokenizer,
+		HistorySelection:      *historySelection,
+		FinalReadiness:        readinessMode,
+		Sandbox:               sandbox.Config{Mode: cfg.Sandbox.Mode, Backend: cfg.Sandbox.Backend, WorkspaceWrite: cfg.Sandbox.WorkspaceWrite, DenyNetwork: cfg.Sandbox.DenyNetwork},
+		DisablePersonalSkills: *noPersonalSkills,
+		DisableAutoDream:      *noAutoDream,
+		DreamInterval:         time.Duration(*dreamInterval * float64(time.Hour)),
+		DreamMinSessions:      *dreamMinSessions,
+		Secrets:               []string{p.APIKey, *visionAPIKey},
+		Input:                 opts.Stdin,
+		Output:                opts.Stdout,
 	}
 	if *mcpConfig != "" {
 		data, readErr := os.ReadFile(*mcpConfig)
@@ -196,6 +265,18 @@ func Run(args []string, opts Options) int {
 	defer agent.Close()
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	if *approveID != "" || *denyID != "" {
+		id, allow := *approveID, true
+		if id == "" {
+			id, allow = *denyID, false
+		}
+		answer, err := agent.ResumeApproval(ctx, id, agent.FactScope.User, allow)
+		if err != nil {
+			return fail(opts.Stderr, err)
+		}
+		fmt.Fprintln(opts.Stdout, answer)
+		return 0
+	}
 	prompt := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if prompt != "" {
 		answer, err := agent.Ask(ctx, prompt)
@@ -214,7 +295,7 @@ func Run(args []string, opts Options) int {
 func runREPL(ctx context.Context, agent *runtime.Agent, opts Options, tui bool) int {
 	var streamOutput *finalStreamOutput
 	if tui {
-		streamOutput = &finalStreamOutput{out: opts.Stdout}
+		streamOutput = &finalStreamOutput{out: opts.Stdout, native: provider.HasNativeTools(agent.Provider)}
 		agent.OnModelStart = streamOutput.Start
 		agent.OnDelta = streamOutput.Delta
 	}
@@ -281,10 +362,41 @@ func slash(ctx context.Context, agent *runtime.Agent, line string, out io.Writer
 	cmd := parts[0]
 	switch cmd {
 	case "/help":
-		fmt.Fprintln(out, "/help /session /memory /dream /skills /todo /workers /usage /reset /exit")
+		fmt.Fprintln(out, "/help /session /memory /dream /skills /mcp refresh NAME /mcp reconnect NAME [1..3] /todo /workers /usage /budget /approvals /approve ID /deny ID /reset /exit")
 		return true, false
 	case "/session":
 		fmt.Fprintf(out, "session: %s\nlatest run: %s\n", agent.SessionID(), agent.LastRunID())
+		return true, false
+	case "/mcp":
+		if agent.MCP == nil {
+			fmt.Fprintln(out, "未配置 MCP 服务。")
+			return true, false
+		}
+		if len(parts) < 3 || len(parts) > 4 || (parts[1] != "refresh" && parts[1] != "reconnect") {
+			fmt.Fprintln(out, "用法：/mcp refresh 服务名 或 /mcp reconnect 服务名 [1..3]")
+			return true, false
+		}
+		var err error
+		if parts[1] == "refresh" {
+			if len(parts) != 3 {
+				fmt.Fprintln(out, "refresh 不接受次数参数")
+				return true, false
+			}
+			err = agent.MCP.Refresh(ctx, parts[2])
+		} else {
+			attempts := 1
+			if len(parts) == 4 {
+				attempts, err = strconv.Atoi(parts[3])
+			}
+			if err == nil {
+				err = agent.MCP.Reconnect(ctx, parts[2], attempts)
+			}
+		}
+		if err != nil {
+			fmt.Fprintln(out, err)
+		} else {
+			fmt.Fprintln(out, "工具目录已更新；不会重放旧调用，也不会扩大允许名单。")
+		}
 		return true, false
 	case "/memory":
 		fmt.Fprintln(out, agent.Memory.Render(""))
@@ -321,6 +433,53 @@ func slash(ctx context.Context, agent *runtime.Agent, line string, out io.Writer
 			fmt.Fprintf(out, "new session: %s\n", agent.SessionID())
 		}
 		return true, false
+	case "/budget":
+		if agent.CostBudget == nil {
+			fmt.Fprintln(out, "未启用费用预算；账本仍记录已知用量。")
+		} else {
+			if len(parts) > 1 {
+				if len(parts) < 5 || parts[1] != "reconcile" {
+					fmt.Fprintln(out, "用法：/budget reconcile 尝试ID 实际纳美元费用 对账说明")
+					return true, false
+				}
+				cost, err := strconv.ParseInt(parts[3], 10, 64)
+				if err == nil {
+					err = agent.CostBudget.Reconcile(ctx, parts[2], cost, strings.Join(parts[4:], " "))
+				}
+				if err != nil {
+					fmt.Fprintln(out, err)
+					return true, false
+				}
+			}
+			snapshot, err := agent.CostBudget.Snapshot(ctx)
+			if err != nil {
+				fmt.Fprintln(out, err)
+			} else {
+				fmt.Fprintf(out, "预算=%d 已结算=%d 未知/在途占用=%d 剩余=%d 纳美元；冻结=%t\n", snapshot.LimitNanoUSD, snapshot.SpentNanoUSD, snapshot.HeldNanoUSD, snapshot.RemainingNanoUSD, snapshot.Frozen)
+			}
+		}
+		return true, false
+	case "/approvals":
+		pending, err := agent.PendingApprovals(ctx)
+		if err != nil {
+			fmt.Fprintln(out, err)
+		} else {
+			b, _ := json.MarshalIndent(pending, "", "  ")
+			fmt.Fprintln(out, string(b))
+		}
+		return true, false
+	case "/approve", "/deny":
+		if len(parts) != 2 {
+			fmt.Fprintln(out, "用法：/approve 审批ID 或 /deny 审批ID")
+			return true, false
+		}
+		answer, err := agent.ResumeApproval(ctx, parts[1], agent.FactScope.User, cmd == "/approve")
+		if err != nil {
+			fmt.Fprintln(out, err)
+		} else {
+			fmt.Fprintln(out, answer)
+		}
+		return true, false
 	case "/exit", "/quit":
 		return true, true
 	case "/maxsteps":
@@ -347,6 +506,7 @@ func clip(s string, n int) string {
 
 type finalStreamOutput struct {
 	out     io.Writer
+	native  bool
 	buffer  string
 	emitted int
 	printed bool
@@ -360,6 +520,23 @@ func (s *finalStreamOutput) Start() {
 
 func (s *finalStreamOutput) Delta(delta string) error {
 	s.buffer += delta
+	if s.native && strings.HasPrefix("<final>", s.buffer) {
+		return nil
+	}
+	if s.native && !strings.HasPrefix(s.buffer, "<final>") {
+		if s.emitted == len(s.buffer) {
+			return nil
+		}
+		if !s.printed {
+			if _, err := fmt.Fprint(s.out, "\n\033[1;32massistant\033[0m\n"); err != nil {
+				return err
+			}
+			s.printed = true
+		}
+		n, err := io.WriteString(s.out, s.buffer[s.emitted:])
+		s.emitted += n
+		return err
+	}
 	start := strings.Index(s.buffer, "<final>")
 	if start < 0 {
 		return nil

@@ -3,6 +3,7 @@ package governance
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"path/filepath"
 	"strings"
 )
 
@@ -102,16 +103,39 @@ func Notice(decision Decision) string {
 }
 
 func IsVerificationCommand(command string) bool {
-	command = strings.ToLower(strings.TrimSpace(command))
-	markers := []string{
-		"go test", "go vet", "go build", "golangci-lint", "staticcheck",
-		"pytest", "python -m pytest", "npm test", "npm run test", "pnpm test", "yarn test",
-		"cargo test", "mvn test", "gradle test", "make test", "make check", "make build",
+	words, ok := verificationWords(command)
+	if !ok {
+		return false
 	}
-	for _, marker := range markers {
-		if strings.Contains(command, marker) {
-			return true
-		}
+	for len(words) > 0 && environmentAssignment(words[0]) {
+		words = words[1:]
+	}
+	if len(words) == 0 {
+		return false
+	}
+	second := ""
+	if len(words) > 1 {
+		second = words[1]
+	}
+	commandName := words[0]
+	if filepath.IsAbs(commandName) {
+		commandName = filepath.Base(commandName)
+	}
+	switch commandName {
+	case "go":
+		return second == "test" || second == "vet" || second == "build"
+	case "pytest", "pytest-3", "staticcheck":
+		return true
+	case "golangci-lint":
+		return second == "run"
+	case "python", "python3":
+		return len(words) > 2 && second == "-m" && words[2] == "pytest"
+	case "npm", "pnpm", "yarn":
+		return second == "test" || len(words) > 2 && second == "run" && words[2] == "test"
+	case "cargo", "mvn", "gradle", "./gradlew":
+		return second == "test"
+	case "make":
+		return second == "test" || second == "check" || second == "build"
 	}
 	return false
 }

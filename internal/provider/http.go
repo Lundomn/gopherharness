@@ -1,7 +1,6 @@
 package provider
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -21,6 +20,8 @@ type httpClient struct {
 	http    *http.Client
 }
 
+func (c *httpClient) ContextPolicy() (int, int, string) { return c.profile.ContextPolicy() }
+
 func NewOpenAI(p config.Provider, timeoutSeconds int) Client {
 	return &openAIClient{httpClient{p, timeout(timeoutSeconds)}}
 }
@@ -32,7 +33,7 @@ func timeout(seconds int) *http.Client {
 	if seconds <= 0 {
 		seconds = 300
 	}
-	return &http.Client{Timeout: time.Duration(seconds) * time.Second}
+	return &http.Client{Timeout: time.Duration(seconds) * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 }
 
 type openAIClient struct{ httpClient }
@@ -71,6 +72,7 @@ func (c *openAIClient) InspectImage(ctx context.Context, mime string, data []byt
 func (c *openAIClient) Stream(ctx context.Context, prompt string, maxTokens int, onDelta func(string) error) (Completion, error) {
 	body := map[string]any{"model": c.profile.Model, "input": prompt, "max_output_tokens": maxTokens, "stream": true}
 	var result Completion
+	done := false
 	err := c.stream(ctx, "/responses", body, map[string]string{"Authorization": "Bearer " + c.profile.APIKey}, func(data []byte) error {
 		var event struct {
 			Type     string `json:"type"`
@@ -83,16 +85,26 @@ func (c *openAIClient) Stream(ctx context.Context, prompt string, maxTokens int,
 		if err := json.Unmarshal(data, &event); err != nil {
 			return err
 		}
-		if event.Delta != "" {
+		if done {
+			return fmt.Errorf("event after response completed")
+		}
+		if event.Type == "error" || event.Type == "response.failed" || event.Type == "response.incomplete" {
+			return fmt.Errorf("provider stream %s", event.Type)
+		}
+		if event.Type == "response.output_text.delta" && event.Delta != "" {
 			result.Text += event.Delta
 			return onDelta(event.Delta)
 		}
 		if event.Type == "response.completed" {
+			done = true
 			result.Usage = event.Response.Usage.Normalized(true)
 			result.ActualModel = event.Response.Model
 		}
 		return nil
 	})
+	if err == nil && !done {
+		err = io.ErrUnexpectedEOF
+	}
 	return result, err
 }
 
@@ -159,6 +171,7 @@ func (c *anthropicClient) Stream(ctx context.Context, prompt string, maxTokens i
 	headers := map[string]string{"x-api-key": c.profile.APIKey, "anthropic-version": "2023-06-01"}
 	var result Completion
 	var usage WireUsage
+	done := false
 	err := c.stream(ctx, "/messages", body, headers, func(data []byte) error {
 		var event struct {
 			Type  string `json:"type"`
@@ -174,6 +187,15 @@ func (c *anthropicClient) Stream(ctx context.Context, prompt string, maxTokens i
 		if err := json.Unmarshal(data, &event); err != nil {
 			return err
 		}
+		if done {
+			return fmt.Errorf("event after message stop")
+		}
+		if event.Type == "error" {
+			return fmt.Errorf("provider stream error")
+		}
+		if event.Type == "message_stop" {
+			done = true
+		}
 		if event.Delta.Text != "" {
 			result.Text += event.Delta.Text
 			return onDelta(event.Delta.Text)
@@ -188,6 +210,9 @@ func (c *anthropicClient) Stream(ctx context.Context, prompt string, maxTokens i
 		result.Usage = usage.Normalized(false)
 		return nil
 	})
+	if err == nil && !done {
+		err = io.ErrUnexpectedEOF
+	}
 	return result, err
 }
 
@@ -250,37 +275,16 @@ func (c *httpClient) stream(ctx context.Context, endpoint string, body any, head
 		limited, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		return responseError(resp, redact(string(limited), c.profile.APIKey))
 	}
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4<<20)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := bytes.TrimSpace([]byte(strings.TrimPrefix(line, "data:")))
-		if string(data) == "[DONE]" {
-			continue
-		}
-		if err := handle(data); err != nil {
-			return err
-		}
-	}
-	return scanner.Err()
+	return readEventStream(resp.Body, handle)
 }
 
 func decodeSSE(r io.Reader, target any) error {
 	var last []byte
-	s := bufio.NewScanner(r)
-	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if strings.HasPrefix(line, "data:") {
-			data := bytes.TrimSpace([]byte(strings.TrimPrefix(line, "data:")))
-			if string(data) != "[DONE]" {
-				last = append(last[:0], data...)
-			}
-		}
-	}
-	if err := s.Err(); err != nil {
+	err := readEventStream(r, func(data []byte) error {
+		last = append(last[:0], data...)
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 	if len(last) == 0 {

@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -38,5 +39,34 @@ func TestFactScopeConflictAuthorityAndCAS(t *testing.T) {
 	old := uint64(0)
 	if err := put("bad", "user_confirmed", &old); !errors.Is(err, ErrRevision) {
 		t.Fatal(err)
+	}
+}
+
+func TestConcurrentDifferentTurnsMergeWithoutRepeatingExtraction(t *testing.T) {
+	ready := make(chan struct{}, 2)
+	release := make(chan struct{})
+	b := OpenBackend(t.TempDir(), func(_ context.Context, e []Evidence) ([]Candidate, error) {
+		ready <- struct{}{}
+		<-release
+		return []Candidate{{Subject: e[0].ID, Attribute: "language", Value: "Go", EvidenceIDs: []string{e[0].ID}}}, nil
+	})
+	scope := Scope{Repo: "project", User: "user"}
+	var wg sync.WaitGroup
+	for _, id := range []string{"one", "two"} {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			if err := b.Store(context.Background(), scope, id, []Evidence{{ID: id, Kind: "user_confirmed", Text: "Go"}}); err != nil {
+				t.Error(err)
+			}
+		}(id)
+	}
+	<-ready
+	<-ready
+	close(release)
+	wg.Wait()
+	facts, err := b.Recall(context.Background(), scope, "", 10)
+	if err != nil || len(facts) != 2 {
+		t.Fatalf("%v %v", facts, err)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/Lundomn/gopherharness/internal/model"
 	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/provider"
+	"github.com/Lundomn/gopherharness/internal/store"
 )
 
 func TestAgentRunsToolLoopAndWritesEvidence(t *testing.T) {
@@ -27,6 +28,7 @@ func TestAgentRunsToolLoopAndWritesEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = agent.Close() })
 	answer, err := agent.Ask(context.Background(), "What does README say?")
 	if err != nil {
 		t.Fatal(err)
@@ -53,7 +55,11 @@ func TestToolBudgetAllowsFinalAnswerButNeverAnotherTool(t *testing.T) {
 			if final {
 				last = `<final>done</final>`
 			}
-			fake := &provider.Fake{Responses: []string{`<tool>{"name":"list_files","args":{"path":"."}}</tool>`, last}}
+			responses := []string{`<tool>{"name":"list_files","args":{"path":"."}}</tool>`, last}
+			if !final {
+				responses = append(responses, last)
+			}
+			fake := &provider.Fake{Responses: responses}
 			a, err := New(Options{Root: root, Config: config.Defaults(), Provider: fake, Approval: permission.Auto, MaxSteps: 1, DisableAutoDream: true})
 			if err != nil {
 				t.Fatal(err)
@@ -75,7 +81,11 @@ func TestToolBudgetAllowsFinalAnswerButNeverAnotherTool(t *testing.T) {
 			if final {
 				want = model.StopFinalAnswer
 			}
-			if report.StopReason != want || report.ToolSteps != 1 || report.Attempts != 2 {
+			attempts := 2
+			if !final {
+				attempts = 3
+			}
+			if report.StopReason != want || report.ToolSteps != 1 || report.Attempts != attempts {
 				t.Fatalf("report=%+v answer=%s", report, answer)
 			}
 			if _, err := os.Stat(filepath.Join(root, "over-budget.txt")); !os.IsNotExist(err) {
@@ -113,7 +123,11 @@ func TestPatchRequiresFreshRead(t *testing.T) {
 	path := filepath.Join(root, "a.txt")
 	_ = os.WriteFile(path, []byte("old"), 0o600)
 	fake := &provider.Fake{Responses: []string{`<tool>{"name":"patch_file","args":{"path":"a.txt","old_text":"old","new_text":"new"}}</tool>`, `<final>done</final>`}}
-	agent, _ := New(Options{Root: root, Config: config.Defaults(), Provider: fake, Approval: permission.Auto, MaxSteps: 2})
+	agent, err := New(Options{Root: root, Config: config.Defaults(), Provider: fake, Approval: permission.Auto, MaxSteps: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = agent.Close() })
 	_, _ = agent.Ask(context.Background(), "patch it")
 	b, _ := os.ReadFile(path)
 	if string(b) != "old" {
@@ -128,6 +142,7 @@ func TestToolAllowlistBlocksUnavailableTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = agent.Close() })
 	_, _ = agent.Ask(context.Background(), "write it")
 	if _, err = os.Stat(filepath.Join(root, "blocked.txt")); !os.IsNotExist(err) {
 		t.Fatal("disallowed tool wrote a file")
@@ -136,12 +151,11 @@ func TestToolAllowlistBlocksUnavailableTool(t *testing.T) {
 
 func TestAutoDreamRunsAfterSessionGate(t *testing.T) {
 	root := t.TempDir()
-	sessions := filepath.Join(root, ".pico", "sessions")
-	if err := os.MkdirAll(sessions, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for _, name := range []string{"older-1.json", "older-2.json"} {
-		if err := os.WriteFile(filepath.Join(sessions, name), []byte(`{}`), 0o600); err != nil {
+	sessions := store.NewSessionStore(root)
+	for range 2 {
+		session := sessions.New(root)
+		session.MemoryUser = "local"
+		if err := sessions.Save(session); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -150,6 +164,7 @@ func TestAutoDreamRunsAfterSessionGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = agent.Close() })
 	if _, err = agent.Ask(context.Background(), "finish"); err != nil {
 		t.Fatal(err)
 	}
@@ -181,6 +196,7 @@ func TestStrictReadinessRequiresVerificationAfterChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = agent.Close() })
 	answer, err := agent.Ask(context.Background(), "change and verify")
 	if err != nil {
 		t.Fatal(err)
@@ -210,6 +226,7 @@ func TestSessionAndTracePersistenceRedactSecrets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = agent.Close() })
 	if _, err = agent.Ask(context.Background(), "record a todo"); err != nil {
 		t.Fatal(err)
 	}
@@ -240,15 +257,23 @@ func TestResumeValidatesLatestCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = first.Close() })
 	if _, err = first.Ask(context.Background(), "first turn"); err != nil {
+		t.Fatal(err)
+	}
+	if err = first.Close(); err != nil {
 		t.Fatal(err)
 	}
 	resumed, err := New(Options{Root: root, Config: config.Defaults(), Provider: &provider.Fake{Responses: []string{`<final>resumed</final>`}}, Resume: first.SessionID(), Approval: permission.Auto, DisableAutoDream: true})
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = resumed.Close() })
 	if resumed.ResumeStatus != model.ResumeFull {
 		t.Fatalf("resume status=%q", resumed.ResumeStatus)
+	}
+	if err = resumed.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if err = os.WriteFile(filepath.Join(root, "README.md"), []byte("changed\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -257,6 +282,7 @@ func TestResumeValidatesLatestCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = mismatched.Close() })
 	if mismatched.ResumeStatus != model.ResumeWorkspace {
 		t.Fatalf("mismatch status=%q", mismatched.ResumeStatus)
 	}

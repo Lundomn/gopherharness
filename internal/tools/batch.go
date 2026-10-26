@@ -24,6 +24,8 @@ type Capability struct {
 }
 
 func (r *Registry) Capability(name string) Capability {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if c, ok := r.capabilities[name]; ok {
 		return c
 	}
@@ -33,7 +35,8 @@ func (r *Registry) Capability(name string) Capability {
 // RunBatch overlaps only consecutive explicitly safe reads. Each bounded group
 // is joined before the next group or side-effect barrier. Results stay in input
 // order. Ordinary error results do not cancel siblings; cancellation does.
-// Registry configuration must be complete before concurrent execution starts.
+// Refreshable remote tools remain Unknown and are never promoted to safe reads
+// by untrusted server annotations.
 func (r *Registry) RunBatch(ctx context.Context, calls []model.ToolCall, limit int, run func(context.Context, model.ToolCall) model.ToolResult) []model.ToolResult {
 	return r.RunIndexedBatch(ctx, calls, limit, func(ctx context.Context, _ int, call model.ToolCall) model.ToolResult { return run(ctx, call) })
 }

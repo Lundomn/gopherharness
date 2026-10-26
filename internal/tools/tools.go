@@ -6,16 +6,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
 	"encoding/json"
 	"github.com/Lundomn/gopherharness/internal/model"
+	"github.com/Lundomn/gopherharness/internal/workspace"
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
@@ -55,10 +55,14 @@ type Definition struct {
 }
 
 type Registry struct {
+	mu           sync.RWMutex
 	specs        map[string]Spec
 	handlers     map[string]Handler
 	capabilities map[string]Capability
 	validators   map[string]*jsonschema.Resolved
+	owners       map[string]string
+	generations  map[string]uint64
+	generation   uint64
 }
 
 func NewRegistry() *Registry {
@@ -66,7 +70,7 @@ func NewRegistry() *Registry {
 	for _, definition := range builtinDefinitions() {
 		_ = r.Register(definition)
 		switch definition.Spec.Name {
-		case "read_file", "list_files", "search":
+		case "read_file", "list_files", "search", "skill_read":
 			r.capabilities[definition.Spec.Name] = Capability{Effect: Read, ConcurrencySafe: true}
 		case "write_file", "patch_file":
 			r.capabilities[definition.Spec.Name] = Capability{Effect: Write}
@@ -82,16 +86,16 @@ func (r *Registry) Register(definition Definition) error {
 	if name == "" || definition.Handler == nil {
 		return errors.New("tool definition requires a name and handler")
 	}
-	if _, exists := r.specs[name]; exists {
-		return fmt.Errorf("tool %q is already registered", name)
-	}
 	definition.Spec.Name = name
 	validator, err := compileSchema(definition.Spec.Schema)
 	if err != nil {
 		return fmt.Errorf("tool %s schema: %w", name, err)
 	}
-	if r.validators == nil {
-		r.validators = map[string]*jsonschema.Resolved{}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.initializeLocked()
+	if _, exists := r.specs[name]; exists {
+		return fmt.Errorf("tool %q is already registered", name)
 	}
 	r.specs[name] = definition.Spec
 	r.handlers[name] = definition.Handler
@@ -100,28 +104,118 @@ func (r *Registry) Register(definition Definition) error {
 	}
 	r.capabilities[name] = Capability{Effect: Unknown}
 	r.validators[name] = validator
+	r.generation++
+	r.generations[name] = r.generation
 	return nil
 }
 
 func builtinDefinitions() []Definition {
 	return []Definition{
-		{Spec{"list_files", false, "List files in the workspace.", `{"path":"string?"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
-			return listFiles(h, str(args, "path", "."))
+		{Spec{"skill_read", false, "Read the cached body of a registered skill by name; does not execute it.", `{"name":"string"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			if err := ctx.Err(); err != nil {
+				return "", nil, err
+			}
+			reader, ok := h.(interface{ ReadSkill(string) (string, error) })
+			if !ok {
+				return "", nil, fmt.Errorf("host does not support registered skill reads")
+			}
+			text, err := reader.ReadSkill(str(args, "name", ""))
+			return text, nil, err
 		}},
-		{Spec{"read_file", false, "Read a UTF-8 file by line range.", `{"path":"string","start":"int?","end":"int?"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
-			return readFile(h, str(args, "path", ""), integer(args, "start", 1), integer(args, "end", 200))
+		{Spec{"list_files", false, "List up to 200 workspace entries without following symlinks.", `{"path":"string?"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			reader, ok := h.(interface {
+				ListFiles(context.Context, string) (string, error)
+			})
+			if !ok {
+				return "", nil, errors.New("host does not support confined directory listing")
+			}
+			out, err := reader.ListFiles(ctx, str(args, "path", "."))
+			return out, nil, err
 		}},
-		{Spec{"search", false, "Search workspace text using a regular expression.", `{"pattern":"string","path":"string?"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
-			return search(h, str(args, "pattern", ""), str(args, "path", "."))
+		{Spec{"read_file", false, "Read a UTF-8 file by line range.", `{"path":"string","start":"int?","end":"int?"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			if host, ok := h.(interface {
+				ReadSnapshot(context.Context, string) ([]byte, error)
+			}); ok {
+				path := str(args, "path", "")
+				start, end := integer(args, "start", 1), integer(args, "end", 200)
+				if path == "" || start < 1 || end < start {
+					return "", nil, errors.New("invalid path or line range")
+				}
+				data, e := host.ReadSnapshot(ctx, path)
+				if e != nil {
+					return "", nil, e
+				}
+				s := bufio.NewScanner(bytes.NewReader(data))
+				s.Buffer(make([]byte, 4096), 64<<20)
+				var lines []string
+				line := 0
+				outputBytes := 0
+				for s.Scan() {
+					if err := ctx.Err(); err != nil {
+						return "", nil, err
+					}
+					line++
+					if line >= start && line <= end {
+						text := fmt.Sprintf("%4d: %s", line, s.Text())
+						if outputBytes+len(text) > workspace.MaxReadToolOutputBytes {
+							lines = append(lines, "[truncated: output exceeds 64 KiB; narrow the line range]")
+							break
+						}
+						lines = append(lines, text)
+						outputBytes += len(text) + 1
+					}
+					if line >= end {
+						break
+					}
+				}
+				return "# " + path + "\n" + strings.Join(lines, "\n"), nil, s.Err()
+			}
+			return "", nil, errors.New("host does not support confined snapshot reads")
+		}},
+		{Spec{"search", false, "Search confined workspace text; at most 200 matches, 4 MiB/file and 32 MiB scanned per call.", `{"pattern":"string","path":"string?"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			reader, ok := h.(interface {
+				SearchFiles(context.Context, string, string) (string, error)
+			})
+			if !ok {
+				return "", nil, errors.New("host does not support confined file search")
+			}
+			out, err := reader.SearchFiles(ctx, str(args, "pattern", ""), str(args, "path", "."))
+			return out, nil, err
 		}},
 		{Spec{"inspect_image", false, "Understand an image with the configured vision model.", `{"path":"string","question":"string?","profile":"string?","output_schema":"string?"}`}, inspectImage},
 		{Spec{"run_shell", true, "Run a shell command in the workspace.", `{"command":"string","timeout":"int?"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
-			return runShell(ctx, h, str(args, "command", ""), integer(args, "timeout", 20))
+			return runShell(ctx, h, str(args, "command", ""), integer(args, "timeout", 60))
 		}},
-		{Spec{"write_file", true, "Write a text file.", `{"path":"string","content":"string"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
+		{Spec{"write_file", true, "Write a text file.", `{"path":"string","content":"string"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			if host, ok := h.(interface {
+				WriteFile(context.Context, string, []byte) error
+			}); ok {
+				p := str(args, "path", "")
+				if p == "" {
+					return "", nil, errors.New("path required")
+				}
+				e := host.WriteFile(ctx, p, []byte(str(args, "content", "")))
+				if e != nil {
+					return "", nil, e
+				}
+				return "wrote " + p, []string{p}, nil
+			}
 			return writeFile(h, str(args, "path", ""), str(args, "content", ""))
 		}},
-		{Spec{"patch_file", true, "Replace one exact text block.", `{"path":"string","old_text":"string","new_text":"string"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
+		{Spec{"patch_file", true, "Replace one exact text block.", `{"path":"string","old_text":"string","new_text":"string"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			if host, ok := h.(interface {
+				PatchFile(context.Context, string, string, string) error
+			}); ok {
+				p := str(args, "path", "")
+				if p == "" {
+					return "", nil, errors.New("path required")
+				}
+				e := host.PatchFile(ctx, p, str(args, "old_text", ""), str(args, "new_text", ""))
+				if e != nil {
+					return "", nil, e
+				}
+				return "patched " + p, []string{p}, nil
+			}
 			return patchFile(h, str(args, "path", ""), str(args, "old_text", ""), str(args, "new_text", ""))
 		}},
 		{Spec{"todo_add", false, "Add a task to the todo ledger.", `{"text":"string"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
@@ -133,14 +227,25 @@ func builtinDefinitions() []Definition {
 		{Spec{"todo_list", false, "List todo entries.", `{}`}, func(_ context.Context, h Host, _ map[string]any) (string, []string, error) {
 			return h.TodoList(), nil, nil
 		}},
-		{Spec{"agent", false, "Start an isolated worker agent.", `{"role":"string","prompt":"string"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
+		{Spec{"agent", false, "Start an isolated worker agent.", `{"role":"string","prompt":"string"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			if host, ok := h.(interface {
+				StartWorkerContext(context.Context, string, string) (string, error)
+			}); ok {
+				out, err := host.StartWorkerContext(ctx, str(args, "role", "explore"), str(args, "prompt", ""))
+				return out, nil, err
+			}
 			out, err := h.StartWorker(str(args, "role", "explore"), str(args, "prompt", ""))
 			return out, nil, err
 		}},
 		{Spec{"send_message", false, "Send a message to a worker.", `{"id":"string","message":"string"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
 			return "message queued", nil, h.SendWorker(str(args, "id", ""), str(args, "message", ""))
 		}},
-		{Spec{"task_stop", false, "Stop a worker.", `{"id":"string"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
+		{Spec{"task_stop", false, "Stop a worker.", `{"id":"string"}`}, func(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
+			if host, ok := h.(interface {
+				StopWorkerContext(context.Context, string) error
+			}); ok {
+				return "worker stopped", nil, host.StopWorkerContext(ctx, str(args, "id", ""))
+			}
 			return "worker stopped", nil, h.StopWorker(str(args, "id", ""))
 		}},
 		{Spec{"enter_plan_mode", false, "Enter plan mode.", `{"path":"string?"}`}, func(_ context.Context, h Host, args map[string]any) (string, []string, error) {
@@ -156,6 +261,8 @@ func builtinDefinitions() []Definition {
 	}
 }
 func (r *Registry) Specs() []Spec {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make([]Spec, 0, len(r.specs))
 	for _, s := range r.specs {
 		out = append(out, s)
@@ -163,49 +270,58 @@ func (r *Registry) Specs() []Spec {
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
-func (r *Registry) Spec(name string) (Spec, bool) { s, ok := r.specs[name]; return s, ok }
+func (r *Registry) Spec(name string) (Spec, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	s, ok := r.specs[name]
+	return s, ok
+}
+
+// Validate returns an owned JSON-normalized action. Approval and execution
+// both use this value, not a mutable map supplied by the model or approver.
+func (r *Registry) Validate(call model.ToolCall) (model.ToolCall, error) {
+	r.mu.RLock()
+	_, ok := r.handlers[call.Name]
+	v := r.validators[call.Name]
+	r.mu.RUnlock()
+	if !ok {
+		return call, fmt.Errorf("%w %q", ErrUnknownTool, call.Name)
+	}
+	return validateCall(call, v)
+}
+
+func validateCall(call model.ToolCall, v *jsonschema.Resolved) (model.ToolCall, error) {
+	args := call.Args
+	if args == nil {
+		args = map[string]any{}
+	}
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return call, err
+	}
+	var normalized map[string]any
+	if err = json.Unmarshal(raw, &normalized); err != nil {
+		return call, err
+	}
+	if v != nil {
+		if err = v.Validate(normalized); err != nil {
+			return call, err
+		}
+	}
+	call.Args = normalized
+	return call, nil
+}
 
 func (r *Registry) Run(ctx context.Context, h Host, call model.ToolCall) model.ToolResult {
-	result := model.ToolResult{Name: call.Name, Status: "ok", Metadata: map[string]any{}}
-	handler, ok := r.handlers[call.Name]
-	if !ok {
-		result.Status = "error"
-		result.Error = fmt.Sprintf("unknown tool %q", call.Name)
-		result.ErrorCode = "unknown_tool"
-		return result
-	}
-	if validator := r.validators[call.Name]; validator != nil {
-		args := call.Args
-		if args == nil {
-			args = map[string]any{}
-		}
-		data, err := json.Marshal(args)
-		var normalized any
-		if err == nil {
-			err = json.Unmarshal(data, &normalized)
-		}
-		if err == nil {
-			err = validator.Validate(normalized)
-		}
-		if err != nil {
-			result.Status = "error"
-			result.Error = err.Error()
-			result.ErrorCode = "invalid_parameters"
-			return result
-		}
-	}
-	output, paths, err := handler(ctx, h, call.Args)
+	invocation, err := r.Prepare(call)
 	if err != nil {
-		result.Status = "error"
-		result.Error = err.Error()
-		if strings.Contains(err.Error(), "escapes workspace") {
-			result.ErrorCode = "path_escape"
+		code := "invalid_parameters"
+		if errors.Is(err, ErrUnknownTool) {
+			code = "unknown_tool"
 		}
-		return result
+		return model.ToolResult{Name: call.Name, Status: "error", Error: err.Error(), ErrorCode: code}
 	}
-	result.Output = output
-	result.AffectedPaths = paths
-	return result
+	return invocation.Run(ctx, h)
 }
 
 func inspectImage(ctx context.Context, h Host, args map[string]any) (string, []string, error) {
@@ -220,131 +336,6 @@ func inspectImage(ctx context.Context, h Host, args map[string]any) (string, []s
 	return out, nil, err
 }
 
-func listFiles(h Host, rel string) (string, []string, error) {
-	p, err := h.Resolve(rel)
-	if err != nil {
-		return "", nil, err
-	}
-	entries, err := os.ReadDir(p)
-	if err != nil {
-		return "", nil, err
-	}
-	var lines []string
-	for i, e := range entries {
-		if i >= 200 {
-			break
-		}
-		kind := "[F]"
-		if e.IsDir() {
-			kind = "[D]"
-		}
-		lines = append(lines, fmt.Sprintf("%s %s", kind, h.Relative(filepath.Join(p, e.Name()))))
-	}
-	if len(lines) == 0 {
-		return "(empty)", nil, nil
-	}
-	return strings.Join(lines, "\n"), nil, nil
-}
-func readFile(h Host, rel string, start, end int) (string, []string, error) {
-	if rel == "" {
-		return "", nil, errors.New("path is required")
-	}
-	if start < 1 || end < start {
-		return "", nil, errors.New("invalid line range")
-	}
-	p, err := h.Resolve(rel)
-	if err != nil {
-		return "", nil, err
-	}
-	f, err := os.Open(p)
-	if err != nil {
-		return "", nil, err
-	}
-	defer f.Close()
-	var lines []string
-	s := bufio.NewScanner(f)
-	n := 0
-	for s.Scan() {
-		n++
-		if n >= start && n <= end {
-			lines = append(lines, fmt.Sprintf("%4d: %s", n, s.Text()))
-		}
-		if n > end {
-			break
-		}
-	}
-	if err = s.Err(); err != nil {
-		return "", nil, err
-	}
-	h.MarkRead(p)
-	return "# " + h.Relative(p) + "\n" + strings.Join(lines, "\n"), nil, nil
-}
-func search(h Host, pattern, rel string) (string, []string, error) {
-	if pattern == "" {
-		return "", nil, errors.New("pattern is required")
-	}
-	re, err := regexp.Compile(pattern)
-	if err != nil {
-		return "", nil, err
-	}
-	p, err := h.Resolve(rel)
-	if err != nil {
-		return "", nil, err
-	}
-	var matches []string
-	walk := func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if d.IsDir() {
-			if d.Name() == ".git" || d.Name() == ".pico" || d.Name() == ".venv" || d.Name() == "node_modules" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		if len(matches) >= 200 {
-			return filepath.SkipAll
-		}
-		f, err := os.Open(path)
-		if err != nil {
-			return nil
-		}
-		defer f.Close()
-		s := bufio.NewScanner(f)
-		n := 0
-		for s.Scan() {
-			n++
-			if re.MatchString(s.Text()) {
-				matches = append(matches, fmt.Sprintf("%s:%d:%s", h.Relative(path), n, s.Text()))
-				if len(matches) >= 200 {
-					break
-				}
-			}
-		}
-		return nil
-	}
-	st, err := os.Stat(p)
-	if err != nil {
-		return "", nil, err
-	}
-	if st.IsDir() {
-		err = filepath.WalkDir(p, walk)
-	} else {
-		err = walk(p, dirEntry{st}, nil)
-	}
-	if err != nil && err != filepath.SkipAll {
-		return "", nil, err
-	}
-	if len(matches) == 0 {
-		return "(no matches)", nil, nil
-	}
-	return strings.Join(matches, "\n"), nil, nil
-}
-
-type dirEntry struct{ fs.FileInfo }
-
-func (d dirEntry) Type() fs.FileMode          { return d.Mode().Type() }
-func (d dirEntry) Info() (fs.FileInfo, error) { return d.FileInfo, nil }
 func runShell(parent context.Context, h Host, command string, seconds int) (string, []string, error) {
 	if strings.TrimSpace(command) == "" {
 		return "", nil, errors.New("command is required")
@@ -352,8 +343,8 @@ func runShell(parent context.Context, h Host, command string, seconds int) (stri
 	if err := safeCommand(command); err != nil {
 		return "", nil, err
 	}
-	if seconds < 1 || seconds > 120 {
-		return "", nil, errors.New("timeout must be in [1,120]")
+	if seconds < 1 || seconds > 600 {
+		return "", nil, errors.New("timeout must be in [1,600]")
 	}
 	out, err := h.ExecuteShell(parent, command, seconds)
 	return out, nil, err

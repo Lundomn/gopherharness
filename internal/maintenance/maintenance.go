@@ -24,6 +24,7 @@ type Config struct {
 	VerifyCommands                                           []string
 	Sandbox                                                  sandbox.Config
 	TimeoutSeconds                                           int
+	ApproveVerifiers                                         bool
 }
 type Repair func(context.Context, string, string) error
 type Result struct {
@@ -80,6 +81,9 @@ func (m *Manager) Issue(ctx context.Context, title, body string) (string, error)
 	return data.URL, nil
 }
 func (m *Manager) Fix(ctx context.Context, request string) (result Result, err error) {
+	if !m.Config.ApproveVerifiers {
+		return result, errors.New("verification commands require explicit approval")
+	}
 	if m.Repair == nil || len(m.Config.VerifyCommands) == 0 {
 		return result, errors.New("repair callback and trusted verification commands required")
 	}

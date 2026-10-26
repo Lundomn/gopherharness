@@ -1,6 +1,9 @@
 package model
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	StatusRunning   = "running"
@@ -41,12 +44,20 @@ type ToolResult struct {
 }
 
 type Message struct {
-	ID         string     `json:"id,omitempty"`
-	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
-	Role       string     `json:"role"`
-	Content    string     `json:"content"`
-	CreatedAt  time.Time  `json:"created_at"`
+	ID            string       `json:"id,omitempty"`
+	ToolCalls     []ToolCall   `json:"tool_calls,omitempty"`
+	ToolCallID    string       `json:"tool_call_id,omitempty"`
+	Role          string       `json:"role"`
+	Content       string       `json:"content"`
+	CreatedAt     time.Time    `json:"created_at"`
+	NativeContent []NativeItem `json:"native_content,omitempty"`
+}
+
+// NativeItem preserves opaque reasoning/signature blocks for the same protocol.
+// It is provider data, never an executable tool or an instruction to the host.
+type NativeItem struct {
+	Protocol string          `json:"protocol"`
+	Data     json.RawMessage `json:"data"`
 }
 
 type TaskState struct {
@@ -96,9 +107,13 @@ type RunReport struct {
 }
 
 type Session struct {
+	Revision      uint64         `json:"revision,omitempty"`
+	Epoch         uint64         `json:"epoch,omitempty"`
+	Fence         string         `json:"-"`
 	SchemaVersion string         `json:"schema_version"`
 	ID            string         `json:"id"`
 	Workspace     string         `json:"workspace"`
+	MemoryUser    string         `json:"memory_user,omitempty"`
 	Messages      []Message      `json:"messages"`
 	Memory        map[string]any `json:"memory,omitempty"`
 	CreatedAt     time.Time      `json:"created_at"`

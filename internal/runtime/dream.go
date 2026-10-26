@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,11 +11,13 @@ import (
 	"time"
 
 	"github.com/Lundomn/gopherharness/internal/evidence"
+	"github.com/Lundomn/gopherharness/internal/model"
 	"github.com/Lundomn/gopherharness/internal/protocol"
+	"github.com/Lundomn/gopherharness/internal/tracing"
 )
 
-func (a *Agent) scheduleDream(recorder *evidence.Recorder) {
-	count := a.Sessions.CountSince(a.Memory.LastDreamAt(), a.Session.ID)
+func (a *Agent) scheduleDream(origin context.Context, recorder *evidence.Recorder) {
+	count := a.ownSessionCount(a.Memory.LastDreamAt(), a.Session.ID)
 	if !a.AutoDream {
 		_ = recorder.Emit("memory_auto_dream_skipped", map[string]any{"reason": "disabled", "session_count": count})
 		return
@@ -30,10 +33,17 @@ func (a *Agent) scheduleDream(recorder *evidence.Recorder) {
 	}
 	_ = recorder.Emit("memory_auto_dream_started", map[string]any{"status": "submitted", "session_count": count})
 	a.dreamWG.Add(1)
+	lifetime := a.lifecycleCtx
+	if lifetime == nil {
+		lifetime = context.Background()
+	}
+	// Maintenance inherits the causal trace, but cancellation belongs to the
+	// owning Agent. Finishing the foreground turn must not kill accepted work.
+	lifetime = tracing.Attach(lifetime, tracing.Current(origin))
 	go func() {
 		defer a.dreamWG.Done()
 		defer release()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		ctx, cancel := context.WithTimeout(lifetime, 5*time.Minute)
 		defer cancel()
 		path, dreamErr := a.consolidateDream(ctx, count)
 		a.dreamErrMu.Lock()
@@ -49,12 +59,27 @@ func (a *Agent) scheduleDream(recorder *evidence.Recorder) {
 }
 
 func (a *Agent) RunDream(ctx context.Context) (string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	if a.lifecycleCtx != nil {
+		stop := context.AfterFunc(a.lifecycleCtx, cancel)
+		defer stop()
+	}
+	if err := a.mu.LockContext(ctx); err != nil {
+		return "", err
+	}
+	defer a.mu.Unlock()
+	if a.closed.Load() {
+		return "", fmt.Errorf("agent is closed")
+	}
+	ctx, timeoutCancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer timeoutCancel()
 	release, err := a.Memory.AcquireDream()
 	if err != nil {
 		return "", err
 	}
 	defer release()
-	path, err := a.consolidateDream(ctx, a.Sessions.Count())
+	path, err := a.consolidateDream(ctx, a.ownSessionCount(time.Time{}, ""))
 	if err != nil {
 		return "", err
 	}
@@ -73,6 +98,9 @@ func (a *Agent) consolidateDream(ctx context.Context, sessionCount int) (string,
 	completion, err := a.Provider.Complete(ctx, prompt, min(a.MaxNewTokens, 4096))
 	if err != nil {
 		return "", fmt.Errorf("dream provider: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	content := completion.Text
 	if parsed := protocol.Parse(content); parsed.Kind == protocol.KindFinal {
@@ -93,15 +121,30 @@ func (a *Agent) recentSessionText(limit, maxChars int) string {
 		}
 	}
 	sort.Strings(paths)
+	// Filter by trusted session owner before applying the recent-session limit.
+	var own []string
+	for _, p := range paths {
+		s, err := a.Sessions.Load(strings.TrimSuffix(filepath.Base(p), ".json"))
+		if err == nil && a.ownsMemorySession(s) {
+			own = append(own, p)
+		}
+	}
+	paths = own
 	if len(paths) > limit {
 		paths = paths[len(paths)-limit:]
 	}
 	var b strings.Builder
 	for _, path := range paths {
-		data, readErr := os.ReadFile(path)
-		if readErr != nil {
+		s, readErr := a.Sessions.Load(strings.TrimSuffix(filepath.Base(path), ".json"))
+		if readErr != nil || !a.ownsMemorySession(s) {
 			continue
 		}
+		// Opaque provider reasoning/signatures and internal state are not facts.
+		messages := make([]map[string]string, 0, len(s.Messages))
+		for _, m := range s.Messages {
+			messages = append(messages, map[string]string{"role": m.Role, "content": m.Content})
+		}
+		data, _ := json.Marshal(messages)
 		remaining := maxChars - b.Len()
 		if remaining <= 0 {
 			break
@@ -115,4 +158,29 @@ func (a *Agent) recentSessionText(limit, maxChars int) string {
 		return "(none)"
 	}
 	return b.String()
+}
+
+func (a *Agent) ownsMemorySession(s *model.Session) bool {
+	user := s.MemoryUser
+	if user == "" {
+		user = "local"
+	}
+	return user == a.FactScope.User
+}
+func (a *Agent) ownSessionCount(since time.Time, exclude string) int {
+	entries, err := os.ReadDir(a.Sessions.Dir)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+			continue
+		}
+		s, err := a.Sessions.Load(strings.TrimSuffix(e.Name(), ".json"))
+		if err == nil && s.ID != exclude && s.UpdatedAt.After(since) && a.ownsMemorySession(s) {
+			n++
+		}
+	}
+	return n
 }

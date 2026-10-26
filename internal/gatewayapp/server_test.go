@@ -23,6 +23,7 @@ import (
 	"github.com/Lundomn/gopherharness/internal/delivery"
 	"github.com/Lundomn/gopherharness/internal/feishu"
 	"github.com/Lundomn/gopherharness/internal/journal"
+	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/provider"
 	"github.com/Lundomn/gopherharness/internal/runtime"
 	larkevent "github.com/larksuite/oapi-sdk-go/v3/event"
@@ -51,6 +52,51 @@ func webhook(t *testing.T, payload, stamp string) *http.Request {
 	r.Header.Set("X-Lark-Request-Nonce", "test-nonce")
 	r.Header.Set("X-Lark-Signature", larkevent.Signature(stamp, "test-nonce", testEncryptKey, string(raw)))
 	return r
+}
+
+type testApprover bool
+
+func (a testApprover) Approve(string, map[string]any) bool { return bool(a) }
+
+func TestConfiguredRemoteToolsCannotBypassApproval(t *testing.T) {
+	for _, policy := range []permission.Policy{permission.Auto, permission.Ask} {
+		c := testConfig(t.TempDir(), "", &provider.Fake{})
+		c.Agent.Approval = policy
+		c.Agent.AllowedTools = []string{"write_file"}
+		if s, err := New(context.Background(), c); err == nil {
+			closeServer(t, s)
+			t.Fatalf("accepted unsafe %s", policy)
+		}
+	}
+	c := testConfig(t.TempDir(), "", &provider.Fake{})
+	c.Agent.Approval = permission.Ask
+	c.Agent.Approver = testApprover(false)
+	c.Agent.AllowedTools = []string{"read_file", "write_file"}
+	s, err := New(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeServer(t, s)
+}
+
+func TestReadyEndpointDoesNotClaimUnstartedSocketReady(t *testing.T) {
+	c := testConfig(t.TempDir(), "", &provider.Fake{})
+	c.Feishu.Transport = "websocket"
+	s, err := New(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeServer(t, s)
+	for _, tc := range []struct {
+		path   string
+		status int
+	}{{"/healthz", 200}, {"/readyz", 503}, {"/events/feishu", 404}} {
+		w := httptest.NewRecorder()
+		s.Handler.ServeHTTP(w, httptest.NewRequest("GET", tc.path, nil))
+		if w.Code != tc.status {
+			t.Fatalf("%s got %d", tc.path, w.Code)
+		}
+	}
 }
 
 func eventPayload(sender, chatType string, mention bool) string {

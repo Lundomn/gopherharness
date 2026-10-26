@@ -1,7 +1,6 @@
 package sandbox
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -15,10 +14,15 @@ import (
 type Config struct {
 	Mode, Backend  string
 	WorkspaceWrite bool
+	DenyNetwork    bool
 }
 type Result struct {
 	ExitCode                int
 	Stdout, Stderr, Backend string
+	StdoutTruncated         bool
+	StderrTruncated         bool
+	StdoutDroppedBytes      int64
+	StderrDroppedBytes      int64
 }
 type Runner struct{ Config Config }
 
@@ -42,6 +46,9 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 	var cmd *exec.Cmd
 	if backend == "bubblewrap" {
 		args := []string{"--die-with-parent", "--new-session", "--proc", "/proc", "--dev", "/dev", "--ro-bind", "/", "/"}
+		if r.Config.DenyNetwork {
+			args = append(args, "--unshare-net")
+		}
 		if r.Config.WorkspaceWrite {
 			args = append(args, "--bind", cwd, cwd)
 		} else {
@@ -59,8 +66,12 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 (import "system.sb")
 (allow process*)
 (allow file-read*)
-(allow file-write* (subpath "/private/tmp") (subpath "/tmp"))
-(allow network*)`
+(allow file-write* (subpath "/private/tmp") (subpath "/tmp"))`
+		if r.Config.DenyNetwork {
+			profile += "\n(deny network*)"
+		} else {
+			profile += "\n(allow network*)"
+		}
 		if r.Config.WorkspaceWrite {
 			profile += `
 (allow file-write* (subpath (param "WORKSPACE")))`
@@ -75,9 +86,9 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 	cmd.Cancel = func() error { killProcessGroup(cmd); return nil }
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout, stderr := newBoundedOutput(MaxOutputBytes/2), newBoundedOutput(MaxOutputBytes/2)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	if err = cmd.Start(); err != nil {
 		return Result{}, err
 	}
@@ -92,7 +103,14 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 		killProcessGroup(cmd)
 		err = <-done
 	}
-	result := Result{Stdout: stdout.String(), Stderr: stderr.String(), Backend: backend}
+	out, outDropped := stdout.snapshot()
+	errout, errDropped := stderr.snapshot()
+	result := Result{Stdout: out, Stderr: errout, Backend: backend, StdoutTruncated: outDropped > 0, StderrTruncated: errDropped > 0, StdoutDroppedBytes: outDropped, StderrDroppedBytes: errDropped}
+	// A killed process must never look like exit 0, even when cancellation is
+	// returned separately. Truncation affects capture only, not exit status.
+	if cmd.ProcessState != nil {
+		result.ExitCode = cmd.ProcessState.ExitCode()
+	}
 	if err != nil {
 		if ctx.Err() != nil {
 			if errors.Is(ctx.Err(), context.Canceled) {
@@ -111,7 +129,18 @@ func (r *Runner) Run(parent context.Context, command, cwd string, env []string, 
 }
 
 func (r *Runner) resolveBackend() (string, error) {
+	switch r.Config.Mode {
+	case "off", "best_effort", "required":
+	default:
+		return "", fmt.Errorf("unknown sandbox mode %q", r.Config.Mode)
+	}
+	if r.Config.Mode == "required" && r.Config.Backend == "none" {
+		return "", errors.New("sandbox required cannot use backend none")
+	}
 	if r.Config.Mode == "off" || r.Config.Backend == "none" {
+		if r.Config.DenyNetwork {
+			return "", errors.New("network isolation requires an active sandbox backend")
+		}
 		return "none", nil
 	}
 	backend := r.Config.Backend
@@ -127,7 +156,7 @@ func (r *Runner) resolveBackend() (string, error) {
 			}
 		}
 		if backend == "auto" {
-			if r.Config.Mode == "required" {
+			if r.Config.Mode == "required" || r.Config.DenyNetwork {
 				return "", fmt.Errorf("sandbox required but no supported backend is available")
 			}
 			return "none", nil
@@ -152,4 +181,10 @@ func (r *Runner) resolveBackend() (string, error) {
 		return backend, nil
 	}
 	return "", fmt.Errorf("unknown sandbox backend %q", strings.TrimSpace(backend))
+}
+
+// Validate checks the isolation contract without starting a command.
+func (r *Runner) Validate() error {
+	_, err := r.resolveBackend()
+	return err
 }

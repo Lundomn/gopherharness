@@ -5,6 +5,17 @@ protocol = "anthropic"
 api_key = ""
 base_url = "https://api.deepseek.com/anthropic"
 model = "deepseek-v4-pro"
+# 按所选模型填写；这是项目配置，不会自动查询服务商窗口。
+context_window_tokens = 65536
+max_output_tokens = 8192
+tokenizer = "cl100k_base"
+# 开启费用预算前必须显式填写四种价格；单位：纳美元 / 百万词元。
+# 1 美元 = 1,000,000,000 纳美元；0 表示已确认免费，不表示未知。
+# 不提供示例行情，避免把过期价格用于预算。
+# input_price_nanousd_per_million = <实际普通输入价格>
+# output_price_nanousd_per_million = <实际输出价格>
+# cache_read_price_nanousd_per_million = <实际缓存读取价格>
+# cache_write_price_nanousd_per_million = <实际缓存写入价格>
 
 [providers.openai]
 protocol = "openai"
@@ -18,7 +29,27 @@ api_key = ""
 base_url = "https://api.anthropic.com"
 model = "claude-sonnet-4-6"
 
+[runtime]
+# 每个模型首次调用之外的重试次数，范围 0～3。
+provider_retries = 3
+# 备用 provider 名称，用逗号分隔的字符串；默认不自动切换。
+fallback_providers = ""
+max_iterations = 40
+# 0 关闭费用准入；例如 1,000,000,000 纳美元等于 1 美元。
+# 开启前主模型、备用模型和独立视觉模型都必须有明确价格。
+cost_limit_nanousd = 0
+
+[memory]
+# 留空使用本地后端；外部服务需实现项目 Memory JSON v1，不是任意产品 URL。
+base_url = ""
+api_key = ""
+timeout_seconds = 30
+extract_facts = false
+
 [sandbox]
+# off / best_effort / required；required 在隔离不可用时拒绝执行。
 mode = "off"
 backend = "auto"
 workspace_write = true
+# 仅约束 Shell 子进程网络；开启必须有可用 OS 沙箱，不能配 off。
+deny_network = false

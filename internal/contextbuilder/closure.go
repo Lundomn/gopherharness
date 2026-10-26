@@ -11,8 +11,14 @@ func ValidateClosure(messages []model.Message) error {
 	pending := map[string]bool{}
 	seen := map[string]bool{}
 	for _, m := range messages {
-		if m.Role == "user" && len(pending) > 0 {
-			return fmt.Errorf("incomplete tool exchange before user turn")
+		if m.Role != "tool" && len(pending) > 0 {
+			return fmt.Errorf("incomplete tool exchange before next message")
+		}
+		if len(m.ToolCalls) > 0 && m.Role != "assistant" {
+			return fmt.Errorf("tool calls require assistant role")
+		}
+		if m.Role == "tool" && m.ToolCallID == "" && len(pending) > 0 {
+			return fmt.Errorf("missing tool result ID in native exchange")
 		}
 		for _, c := range m.ToolCalls {
 			if c.ID == "" || seen[c.ID] {

@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/Lundomn/gopherharness/internal/tracing"
 )
 
 func deadline(t *testing.T) context.Context {
@@ -14,6 +16,99 @@ func deadline(t *testing.T) context.Context {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
 	return ctx
+}
+
+func TestQueueTraceIdentityIsExplicitAndIndependent(t *testing.T) {
+	ctx := deadline(t)
+	seen := make(chan tracing.Identity, 2)
+	s := New(func(ctx context.Context, r Request, _ func() []Request) (string, error) {
+		id := tracing.Current(ctx)
+		if id != r.Trace {
+			t.Error("queue envelope and execution trace differ")
+		}
+		seen <- id
+		return r.Text, nil
+	}, 2, 1, 8)
+	defer s.Close(ctx)
+	h1, err := s.Submit(tracing.Attach(ctx, tracing.Identity{TraceID: "trace-a", SpanID: "submit-a"}), Request{Conversation: "a", Text: "one"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h2, err := s.Submit(ctx, Request{Conversation: "b", Text: "two", Trace: tracing.Identity{TraceID: "trace-b", SpanID: "submit-b"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, h := range []*Handle{h1, h2} {
+		if _, err := h.Wait(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ids := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		ids[(<-seen).TraceID] = true
+	}
+	if !ids["trace-a"] || !ids["trace-b"] {
+		t.Fatal(ids)
+	}
+}
+
+func TestForeignSenderCannotInjectOrInterruptActiveLane(t *testing.T) {
+	ctx := deadline(t)
+	started := make(chan struct{})
+	s := New(func(ctx context.Context, _ Request, _ func() []Request) (string, error) {
+		close(started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}, 1, 1, 8)
+	source := Source{Channel: "test", ChatID: "group", SenderID: "alice"}
+	_, err := s.Submit(ctx, Request{Conversation: "fixed", Text: "first", Source: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	for _, policy := range []Policy{Inject, Interrupt, Append} {
+		source.SenderID = "mallory"
+		if _, err := s.Submit(ctx, Request{Conversation: "fixed", Text: "attack", Source: source, Busy: policy}); err == nil {
+			t.Fatal("accepted foreign sender", policy)
+		}
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInterruptWaitsForOldCleanupBeforeNextTurn(t *testing.T) {
+	ctx := deadline(t)
+	started := make(chan string, 2)
+	cancelled := make(chan struct{})
+	cleanup := make(chan struct{})
+	s := New(func(ctx context.Context, r Request, _ func() []Request) (string, error) {
+		started <- r.Text
+		if r.Text == "old" {
+			<-ctx.Done()
+			close(cancelled)
+			<-cleanup
+			return "", ctx.Err()
+		}
+		return r.Text, nil
+	}, 2, 1, 8)
+	old, _ := s.Submit(ctx, Request{Conversation: "a", Text: "old"})
+	<-started
+	next, _ := s.Submit(ctx, Request{Conversation: "a", Text: "next", Busy: Interrupt})
+	<-cancelled
+	select {
+	case <-started:
+		t.Fatal("replacement overlapped cancelled runner cleanup")
+	default:
+	}
+	close(cleanup)
+	_, _ = old.Wait(ctx)
+	if answer, err := next.Wait(ctx); err != nil || answer != "next" {
+		t.Fatalf("%s %v", answer, err)
+	}
+	if err := s.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSameConversationSerialAndDifferentConversationOverlap(t *testing.T) {

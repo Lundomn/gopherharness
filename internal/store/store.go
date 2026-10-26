@@ -2,9 +2,12 @@ package store
 
 import (
 	"bufio"
+	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Lundomn/gopherharness/internal/durable"
 	"github.com/Lundomn/gopherharness/internal/model"
 )
 
@@ -27,8 +31,84 @@ func (s *SessionStore) New(workspace string) *model.Session {
 }
 
 func (s *SessionStore) Save(session *model.Session) error {
-	session.UpdatedAt = time.Now().UTC()
-	return writeJSON(filepath.Join(s.Dir, session.ID+".json"), session)
+	if !validSessionID(session.ID) {
+		return fmt.Errorf("invalid session id")
+	}
+	next := *session
+	err := (durable.File[model.Session]{Path: filepath.Join(s.Dir, session.ID+".json")}).Update(context.Background(), func(current *model.Session) error {
+		if err := checkSessionFence(session, current); err != nil {
+			return err
+		}
+		next.Revision = current.Revision + 1
+		if next.Epoch == 0 {
+			next.Epoch = 1
+		}
+		next.UpdatedAt = time.Now().UTC()
+		*current = next
+		return nil
+	})
+	if err == nil {
+		next.Fence = sessionFence(&next)
+		*session = next
+	}
+	return err
+}
+
+var ErrSessionConflict = errors.New("session owner or content changed; reload before writing")
+
+func validSessionID(id string) bool {
+	return id != "" && id != "." && id != ".." && filepath.Base(id) == id && !strings.ContainsAny(id, `/\\`)
+}
+func sessionFence(s *model.Session) string {
+	raw, _ := json.Marshal(s)
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+func checkSessionFence(want, current *model.Session) error {
+	if current.ID == "" {
+		if want.Revision != 0 || want.Fence != "" {
+			return ErrSessionConflict
+		}
+		return nil
+	}
+	if current.ID != want.ID || current.Revision != want.Revision || current.Epoch != want.Epoch || want.Fence == "" || sessionFence(current) != want.Fence {
+		return ErrSessionConflict
+	}
+	return nil
+}
+
+// TurnLease is held only while a turn executes, not while a chat is idle.
+// It serializes cooperating processes; context cancellation interrupts waiting.
+func (s *SessionStore) TurnLease(ctx context.Context, id string) (func(), error) {
+	if !validSessionID(id) {
+		return nil, fmt.Errorf("invalid session id")
+	}
+	return durable.Lease(ctx, filepath.Join(s.Dir, id+".turn.lock"))
+}
+
+// Claim advances the owner generation under the turn lease. Stale objects may
+// still exist, but their next Save fails both epoch and content checks.
+func (s *SessionStore) Claim(ctx context.Context, session *model.Session) error {
+	release, err := s.TurnLease(ctx, session.ID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	next := *session
+	err = (durable.File[model.Session]{Path: filepath.Join(s.Dir, session.ID+".json")}).Update(ctx, func(current *model.Session) error {
+		if err := checkSessionFence(session, current); err != nil {
+			return err
+		}
+		next.Epoch = current.Epoch + 1
+		next.Revision = current.Revision + 1
+		*current = next
+		return nil
+	})
+	if err == nil {
+		next.Fence = sessionFence(&next)
+		*session = next
+	}
+	return err
 }
 
 func (s *SessionStore) Load(id string) (*model.Session, error) {
@@ -46,6 +126,10 @@ func (s *SessionStore) Load(id string) (*model.Session, error) {
 	if err := readJSON(filepath.Join(s.Dir, id+".json"), &session); err != nil {
 		return nil, err
 	}
+	if session.ID != id {
+		return nil, fmt.Errorf("session ID does not match file")
+	}
+	session.Fence = sessionFence(&session)
 	return &session, nil
 }
 
@@ -168,11 +252,7 @@ func writeJSON(path string, value any) error {
 		return err
 	}
 	b = append(b, '\n')
-	tmp := path + ".tmp-" + hex.EncodeToString([]byte(fmt.Sprint(time.Now().UnixNano())))
-	if err = os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return durable.Replace(path, b)
 }
 func readJSON(path string, value any) error {
 	b, err := os.ReadFile(path)

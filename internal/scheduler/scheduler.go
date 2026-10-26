@@ -7,9 +7,22 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/Lundomn/gopherharness/internal/tracing"
 )
 
 type Policy string
+
+const DepthWarningThreshold = 50
+
+type LaneStatus struct {
+	Queued       int
+	Injected     int
+	Active       bool
+	Paused       bool
+	DepthWarning bool
+	Capacity     int
+}
 
 const (
 	Append    Policy = "append"
@@ -28,6 +41,14 @@ type Request struct {
 	Source       Source
 	Background   bool
 	Busy         Policy
+	// Approval controls are supplied by authenticated host code, not chat text.
+	ApprovalID         string
+	ApprovalAllowed    bool
+	WorkerResults      bool
+	WorkerSummaryRunID string
+	// Trace is copied into the queue envelope, never read from a global current
+	// request. The consumer keeps its own cancellation/deadline ownership.
+	Trace tracing.Identity
 }
 type Result struct {
 	Text   string
@@ -68,6 +89,8 @@ type lane struct {
 	inbox   []*job
 	active  *job
 	running bool
+	paused  bool
+	source  Source
 }
 type Scheduler struct {
 	mu                     sync.Mutex
@@ -86,6 +109,18 @@ func New(run Runner, userSlots, systemSlots, queueCapacity int) *Scheduler {
 		panic("invalid scheduler configuration")
 	}
 	return &Scheduler{run: run, lanes: map[string]*lane{}, foreground: make(chan struct{}, userSlots), background: make(chan struct{}, systemSlots), capacity: queueCapacity, done: make(chan struct{})}
+}
+
+// Status is an observation, not an admission policy. Fifty waiting messages is
+// a warning threshold; the independently configured hard queue capacity applies.
+func (s *Scheduler) Status(conversation string) (LaneStatus, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	l, ok := s.lanes[conversation]
+	if !ok {
+		return LaneStatus{}, false
+	}
+	return LaneStatus{Queued: len(l.queue), Injected: len(l.inbox), Active: l.active != nil, Paused: l.paused, DepthWarning: len(l.queue)+len(l.inbox) >= DepthWarningThreshold, Capacity: s.capacity}, true
 }
 func (s *Scheduler) Submit(ctx context.Context, req Request) (*Handle, error) {
 	if req.Conversation == "" {
@@ -107,26 +142,34 @@ func (s *Scheduler) Submit(ctx context.Context, req Request) (*Handle, error) {
 	}
 	l := s.lanes[req.Conversation]
 	if l == nil {
-		l = &lane{}
+		l = &lane{source: req.Source}
 		s.lanes[req.Conversation] = l
+	} else if l.source != req.Source {
+		// Reject before INJECT/INTERRUPT can mutate another identity's turn.
+		return nil, errors.New("conversation source identity mismatch")
 	}
 	if len(l.queue)+len(l.inbox) >= s.capacity {
 		return nil, errors.New("conversation queue full")
 	}
 	jobCtx, cancel := context.WithCancel(ctx)
+	if req.Trace.TraceID == "" {
+		req.Trace = tracing.Current(ctx)
+	}
+	jobCtx = tracing.Attach(jobCtx, req.Trace)
 	h := &Handle{done: make(chan struct{}), cancel: cancel}
 	j := &job{req: req, ctx: jobCtx, handle: h}
-	if req.Busy == Inject && l.active != nil {
+	if req.ApprovalID != "" {
+		l.queue = append([]*job{j}, l.queue...)
+	} else if req.Busy == Inject && l.active != nil {
 		l.inbox = append(l.inbox, j)
 		return h, nil
-	}
-	if req.Busy == Interrupt && l.active != nil {
+	} else if req.Busy == Interrupt && l.active != nil {
 		l.active.handle.Cancel()
 		l.queue = append([]*job{j}, l.queue...)
 	} else {
 		l.queue = append(l.queue, j)
 	}
-	if !l.running {
+	if !l.running && (!l.paused || req.ApprovalID != "") {
 		l.running = true
 		s.wg.Add(1)
 		go s.work(req.Conversation, l)
@@ -137,8 +180,11 @@ func (s *Scheduler) work(cid string, l *lane) {
 	defer s.wg.Done()
 	for {
 		s.mu.Lock()
-		if len(l.queue) == 0 {
-			delete(s.lanes, cid)
+		if len(l.queue) == 0 || (l.paused && l.queue[0].req.ApprovalID == "") {
+			l.running = false
+			if !l.paused {
+				delete(s.lanes, cid)
+			}
 			s.mu.Unlock()
 			return
 		}
@@ -198,6 +244,12 @@ func (s *Scheduler) work(cid string, l *lane) {
 		l.queue = append(l.queue, l.inbox...)
 		l.inbox = nil
 		l.active = nil
+		var pause interface{ PauseConversation() bool }
+		if errors.As(result.Err, &pause) && pause.PauseConversation() {
+			l.paused = true
+		} else if j.req.ApprovalID != "" && result.Err == nil {
+			l.paused = false
+		}
 		s.mu.Unlock()
 	}
 }
@@ -218,7 +270,9 @@ func (s *Scheduler) CancelConversation(cid string) {
 		}
 		for _, j := range append(append([]*job{}, l.queue...), l.inbox...) {
 			j.handle.Cancel()
+			j.handle.finish(Result{Err: context.Canceled})
 		}
+		l.queue, l.inbox = nil, nil
 	}
 }
 
@@ -233,7 +287,9 @@ func (s *Scheduler) Seal() {
 		}
 		for _, j := range append(append([]*job{}, l.queue...), l.inbox...) {
 			j.handle.Cancel()
+			j.handle.finish(Result{Err: context.Canceled})
 		}
+		l.queue, l.inbox = nil, nil
 	}
 	s.mu.Unlock()
 }

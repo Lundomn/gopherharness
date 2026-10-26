@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/Lundomn/gopherharness/internal/config"
 	"github.com/Lundomn/gopherharness/internal/provider"
@@ -21,7 +23,7 @@ func TestEvaluatorRunsFixtureAndVerifier(t *testing.T) {
 	path := filepath.Join(root, "benchmark.json")
 	_ = os.WriteFile(path, raw, 0o600)
 	fake := &provider.Fake{Responses: []string{`<tool>{"name":"write_file","args":{"path":"result.txt","content":"ok"}}</tool>`, `<final>done</final>`}}
-	artifact, err := Run(context.Background(), Options{BenchmarkPath: path, FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "workspaces"), ArtifactPath: filepath.Join(root, "artifact.json"), Config: config.Defaults(), Provider: fake})
+	artifact, err := Run(context.Background(), Options{BenchmarkPath: path, FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "workspaces"), ArtifactPath: filepath.Join(root, "artifact.json"), Config: config.Defaults(), Provider: fake, AllowHostVerifier: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +82,7 @@ func TestEvaluatorUsesTaskLocalResponsesWithoutProvider(t *testing.T) {
 	}
 	artifact, err := Run(context.Background(), Options{
 		BenchmarkPath: benchmarkPath, FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "workspaces"),
-		Config: config.Defaults(),
+		Config: config.Defaults(), AllowHostVerifier: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -118,7 +120,7 @@ func TestEvaluatorAcceptsDeclaredNegativeControl(t *testing.T) {
 	if err = os.WriteFile(benchmarkPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	artifact, err := Run(context.Background(), Options{BenchmarkPath: benchmarkPath, FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "workspaces"), Config: config.Defaults()})
+	artifact, err := Run(context.Background(), Options{BenchmarkPath: benchmarkPath, FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "workspaces"), Config: config.Defaults(), AllowHostVerifier: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,5 +177,50 @@ func TestNegativeControlStillRequiresArtifact(t *testing.T) {
 	row := runTask(context.Background(), Options{FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "work"), Config: config.Defaults()}, task)
 	if row.Passed || row.FailureCategory != "missing_artifact" {
 		t.Fatalf("negative control skipped artifact condition: %+v", row)
+	}
+}
+
+func TestVerifierRequiresExplicitHostPermissionOrRealSandbox(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "fixture"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	b := Benchmark{SchemaVersion: 1, Tasks: []Task{{ID: "safe", Prompt: "finish", FixtureRepo: "fixture", Verifier: "true", Responses: []string{"<final>done</final>"}, AllowedTools: []string{"read_file"}, StepBudget: 1}}}
+	raw, _ := json.Marshal(b)
+	path := filepath.Join(root, "benchmark.json")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(context.Background(), Options{BenchmarkPath: path, Config: config.Defaults()}); err == nil || !strings.Contains(err.Error(), "AllowHostVerifier") {
+		t.Fatalf("host verifier was not gated: %v", err)
+	}
+	cfg := config.Defaults()
+	cfg.Sandbox.Mode, cfg.Sandbox.Backend = "required", "none"
+	if _, err := Run(context.Background(), Options{BenchmarkPath: path, Config: cfg, AllowHostVerifier: true}); err == nil || !strings.Contains(err.Error(), "cannot use backend none") {
+		t.Fatalf("required sandbox degraded: %v", err)
+	}
+}
+
+func TestVerifierTimeoutPreservesPreviousWorkspace(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "fixture"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	old := filepath.Join(root, "work", "timeout", "fixture")
+	if err := os.MkdirAll(old, 0700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(old, "user-file")
+	if err := os.WriteFile(marker, []byte("keep"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	task := Task{ID: "timeout", Prompt: "finish", FixtureRepo: "fixture", Responses: []string{"<final>done</final>"}, StepBudget: 1, Verifier: "sleep 30"}
+	started := time.Now()
+	row := runTask(context.Background(), Options{FixtureRoot: root, WorkspaceRoot: filepath.Join(root, "work"), Config: config.Defaults(), VerifierTimeoutSeconds: 1}, task)
+	if row.Passed || row.VerifierExitCode == 0 || !strings.Contains(row.VerifierStderr, "timeout") || time.Since(started) > 4*time.Second {
+		t.Fatalf("verifier not bounded: %#v", row)
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != "keep" {
+		t.Fatalf("previous workspace changed: %s %v", data, err)
 	}
 }

@@ -26,7 +26,7 @@ func TestFixUsesIndependentPinnedWorktrees(t *testing.T) {
 	if _, e := git(ctx, root, "commit", "-m", "fixture"); e != nil {
 		t.Fatal(e)
 	}
-	m := Manager{Config: Config{Root: root, VerifyCommands: []string{"test \"$(cat code.txt)\" = good"}}, Repair: func(ctx context.Context, dir, q string) error {
+	m := Manager{Config: Config{Root: root, ApproveVerifiers: true, VerifyCommands: []string{"test \"$(cat code.txt)\" = good"}}, Repair: func(ctx context.Context, dir, q string) error {
 		return durable.Replace(filepath.Join(dir, "code.txt"), []byte("good\n"))
 	}}
 	r, e := m.Fix(ctx, "fix it")

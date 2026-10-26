@@ -6,7 +6,8 @@
 2. 阅读 `internal/runtime/engine.go`，跟踪完整的 turn 状态机。
 3. 从 `protocol.Parse` 开始跟踪一次工具调用，直到 `tools.Registry` 的 handler。
 4. 阅读 `workspace.Resolve` 和 fresh-read 测试，理解工作区安全边界。
-5. 阅读 `contextbuilder.BuildChecked`、Curator 和闭包校验，理解字节预算、历史分组及工具结果保护。
+5. 阅读 `contextbuilder.BuildChecked`、词元计数器与闭包校验，理解窗口减输出、固定材料预留、历史六成阈值、最终复算及工具结果保护。
+   再阅读 `memory.InputBuilder` 的宿主资料/后端召回两路，以及 `skills.Registry.Resolve` 的常驻/BM25/正文激活/引用边界，不把工作状态当作第二路长期记忆。
 6. 跟踪 `evidence.Recorder` 到 trace、session 和 run JSONL 的递归脱敏。
 7. 分别阅读 memory、plan、todo、worker、skills 和 sandbox 模块。
 8. 阅读 `worker.Manager` 和 auto-dream，理解 goroutine、channel、context、锁和 wait group。

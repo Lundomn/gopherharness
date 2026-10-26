@@ -3,12 +3,27 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
 func compileSchema(raw string) (*jsonschema.Resolved, error) {
+	data, err := JSONSchema(raw)
+	if err != nil {
+		return nil, err
+	}
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(data, &schema); err != nil {
+		return nil, err
+	}
+	return schema.Resolve(nil)
+}
+
+// JSONSchema expands builtin shorthand into the same schema sent to models
+// and used by local validation. Callers never advertise a different contract.
+func JSONSchema(raw string) (json.RawMessage, error) {
 	var object map[string]any
 	if err := json.Unmarshal([]byte(raw), &object); err != nil {
 		return nil, err
@@ -38,6 +53,7 @@ func compileSchema(raw string) (*jsonschema.Resolved, error) {
 			}
 		}
 		object = map[string]any{"type": "object", "properties": properties, "additionalProperties": false}
+		sort.Strings(required)
 		if len(required) > 0 {
 			object["required"] = required
 		}
@@ -46,11 +62,7 @@ func compileSchema(raw string) (*jsonschema.Resolved, error) {
 	if err != nil {
 		return nil, err
 	}
-	var schema jsonschema.Schema
-	if err := json.Unmarshal(data, &schema); err != nil {
-		return nil, err
-	}
-	return schema.Resolve(nil)
+	return data, nil
 }
 
 func localReferencesOnly(value any) error {
@@ -76,16 +88,20 @@ func localReferencesOnly(value any) error {
 	return nil
 }
 
-// RegisterAll validates the entire directory before publication. Configuration
-// is startup-only; callers must not register while Run/RunBatch is executing.
+// RegisterAll validates the entire directory before atomic publication.
 func (r *Registry) RegisterAll(definitions []Definition) error {
 	tmp := &Registry{specs: map[string]Spec{}, handlers: map[string]Handler{}}
 	for _, d := range definitions {
-		if _, exists := r.Spec(strings.TrimSpace(d.Spec.Name)); exists {
-			return fmt.Errorf("duplicate tool %q", d.Spec.Name)
-		}
 		if err := tmp.Register(d); err != nil {
 			return err
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.initializeLocked()
+	for name := range tmp.specs {
+		if _, exists := r.specs[name]; exists {
+			return fmt.Errorf("duplicate tool %q", name)
 		}
 	}
 	for name, spec := range tmp.specs {
@@ -93,6 +109,8 @@ func (r *Registry) RegisterAll(definitions []Definition) error {
 		r.handlers[name] = tmp.handlers[name]
 		r.validators[name] = tmp.validators[name]
 		r.capabilities[name] = tmp.capabilities[name]
+		r.generation++
+		r.generations[name] = r.generation
 	}
 	return nil
 }

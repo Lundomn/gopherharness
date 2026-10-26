@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -33,6 +32,8 @@ type Config struct {
 	AppID, AppSecret, VerificationToken, EncryptKey, BotOpenID string
 	BaseURL, Root                                              string
 	AllowedSenders                                             []string
+	AllowedChats                                               []string
+	Transport                                                  string // webhook (default) or websocket
 	Busy                                                       scheduler.Policy
 }
 type Adapter struct {
@@ -45,8 +46,17 @@ type Adapter struct {
 }
 
 func New(c Config, publish func(gateway.Event) error) (*Adapter, error) {
-	if c.AppID == "" || c.AppSecret == "" || c.VerificationToken == "" || c.EncryptKey == "" || c.BotOpenID == "" || len(c.AllowedSenders) == 0 || publish == nil {
-		return nil, errors.New("Feishu credentials, encrypted webhook, bot identity and explicit sender allowlist required")
+	if c.Transport == "" {
+		c.Transport = "webhook"
+	}
+	if c.Transport != "webhook" && c.Transport != "websocket" {
+		return nil, errors.New("Feishu transport must be webhook or websocket")
+	}
+	if c.AppID == "" || c.AppSecret == "" || c.BotOpenID == "" || len(c.AllowedSenders) == 0 || publish == nil {
+		return nil, errors.New("Feishu credentials, bot identity and explicit sender allowlist required")
+	}
+	if c.Transport == "webhook" && (c.VerificationToken == "" || c.EncryptKey == "") {
+		return nil, errors.New("encrypted webhook requires verification token and encrypt key")
 	}
 	seen := map[string]bool{}
 	var allowed []string
@@ -61,6 +71,11 @@ func New(c Config, publish func(gateway.Event) error) (*Adapter, error) {
 		}
 	}
 	c.AllowedSenders = allowed
+	for _, chat := range c.AllowedChats {
+		if strings.TrimSpace(chat) == "" || chat == "*" || strings.TrimSpace(chat) != chat {
+			return nil, errors.New("chat allowlist requires explicit non-empty chat IDs")
+		}
+	}
 	if c.BaseURL == "" {
 		c.BaseURL = "https://open.feishu.cn/open-apis"
 	}
@@ -76,6 +91,15 @@ func (a *Adapter) Allowed(source scheduler.Source) bool {
 	if source.Channel != "feishu" {
 		return false
 	}
+	if len(a.Config.AllowedChats) > 0 {
+		found := false
+		for _, chat := range a.Config.AllowedChats {
+			found = found || source.ChatID == chat
+		}
+		if !found {
+			return false
+		}
+	}
 	for _, id := range a.Config.AllowedSenders {
 		if id == source.SenderID {
 			return true
@@ -84,6 +108,9 @@ func (a *Adapter) Allowed(source scheduler.Source) bool {
 	return false
 }
 func (a *Adapter) Handler() http.Handler {
+	if a.Config.Transport != "webhook" {
+		return http.NotFoundHandler()
+	}
 	d := dispatcher.NewEventDispatcher(a.Config.VerificationToken, a.Config.EncryptKey).OnP2MessageReceiveV1(a.Receive)
 	d.InitConfig()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -139,6 +166,9 @@ func (a *Adapter) Receive(ctx context.Context, e *im.P2MessageReceiveV1) error {
 		return errors.New("incomplete Feishu event")
 	}
 	s, m := e.Event.Sender, e.Event.Message
+	if value(m.ChatType) != "p2p" && value(m.ChatType) != "group" {
+		return nil
+	}
 	if value(s.SenderType) != "user" || s.SenderId == nil {
 		return nil
 	}
@@ -316,11 +346,7 @@ func (a *Adapter) download(ctx context.Context, id, key, kind string) (string, e
 		ext = ".pdf"
 	}
 	rel := filepath.Join(".pico", "media", hex.EncodeToString(sum[:])+ext)
-	path := filepath.Join(a.Config.Root, rel)
-	if err = os.MkdirAll(filepath.Dir(path), 0700); err != nil {
-		return "", err
-	}
-	return rel, durable.Replace(path, data)
+	return rel, durable.ReplaceWithin(a.Config.Root, rel, data)
 }
 func (a *Adapter) Idempotent() bool { return true }
 func (a *Adapter) Send(ctx context.Context, m delivery.Message) (delivery.Receipt, error) {

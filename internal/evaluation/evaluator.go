@@ -1,14 +1,12 @@
 package evaluation
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -19,6 +17,8 @@ import (
 	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/provider"
 	"github.com/Lundomn/gopherharness/internal/runtime"
+	"github.com/Lundomn/gopherharness/internal/sandbox"
+	"github.com/Lundomn/gopherharness/internal/workspace"
 )
 
 type Benchmark struct {
@@ -39,29 +39,31 @@ type Task struct {
 	ExpectedStopReason string   `json:"expected_stop_reason,omitempty"`
 }
 type Row struct {
-	ID                 string `json:"id"`
-	Status             string `json:"status"`
-	FailureCategory    string `json:"failure_category,omitempty"`
-	Answer             string `json:"answer,omitempty"`
-	Workspace          string `json:"workspace"`
-	RunID              string `json:"run_id"`
-	Passed             bool   `json:"passed"`
-	ArtifactExists     bool   `json:"artifact_exists"`
-	VerifierPassed     bool   `json:"verifier_passed"`
-	WithinBudget       bool   `json:"within_budget"`
-	ToolSteps          int    `json:"tool_steps"`
-	Attempts           int    `json:"attempts"`
-	StopReason         string `json:"stop_reason,omitempty"`
-	RunStatus          string `json:"run_status,omitempty"`
-	ExpectedStopReason string `json:"expected_stop_reason,omitempty"`
-	ExpectedFailure    bool   `json:"expected_failure,omitempty"`
-	Category           string `json:"category,omitempty"`
-	VerifierExitCode   int    `json:"verifier_exit_code"`
-	VerifierStdout     string `json:"verifier_stdout,omitempty"`
-	VerifierStderr     string `json:"verifier_stderr,omitempty"`
-	FixtureDigest      string `json:"fixture_digest,omitempty"`
-	ArtifactDigest     string `json:"artifact_digest,omitempty"`
-	DurationMS         int64  `json:"duration_ms"`
+	ID                      string `json:"id"`
+	Status                  string `json:"status"`
+	FailureCategory         string `json:"failure_category,omitempty"`
+	Answer                  string `json:"answer,omitempty"`
+	Workspace               string `json:"workspace"`
+	RunID                   string `json:"run_id"`
+	Passed                  bool   `json:"passed"`
+	ArtifactExists          bool   `json:"artifact_exists"`
+	VerifierPassed          bool   `json:"verifier_passed"`
+	WithinBudget            bool   `json:"within_budget"`
+	ToolSteps               int    `json:"tool_steps"`
+	Attempts                int    `json:"attempts"`
+	StopReason              string `json:"stop_reason,omitempty"`
+	RunStatus               string `json:"run_status,omitempty"`
+	ExpectedStopReason      string `json:"expected_stop_reason,omitempty"`
+	ExpectedFailure         bool   `json:"expected_failure,omitempty"`
+	Category                string `json:"category,omitempty"`
+	VerifierExitCode        int    `json:"verifier_exit_code"`
+	VerifierStdout          string `json:"verifier_stdout,omitempty"`
+	VerifierStderr          string `json:"verifier_stderr,omitempty"`
+	VerifierStdoutTruncated bool   `json:"verifier_stdout_truncated,omitempty"`
+	VerifierStderrTruncated bool   `json:"verifier_stderr_truncated,omitempty"`
+	FixtureDigest           string `json:"fixture_digest,omitempty"`
+	ArtifactDigest          string `json:"artifact_digest,omitempty"`
+	DurationMS              int64  `json:"duration_ms"`
 }
 type Summary struct {
 	TotalTasks       int            `json:"total_tasks"`
@@ -87,6 +89,8 @@ type Options struct {
 	BenchmarkPath, FixtureRoot, WorkspaceRoot, ArtifactPath string
 	Config                                                  config.Config
 	Provider                                                provider.Client
+	VerifierTimeoutSeconds                                  int
+	AllowHostVerifier                                       bool
 }
 
 func Run(ctx context.Context, opts Options) (Artifact, error) {
@@ -98,6 +102,15 @@ func Run(ctx context.Context, opts Options) (Artifact, error) {
 		opts.FixtureRoot = filepath.Dir(opts.BenchmarkPath)
 	}
 	if err := validateBenchmark(b, opts.FixtureRoot); err != nil {
+		return Artifact{}, err
+	}
+	if !opts.AllowHostVerifier && opts.Config.Sandbox.Mode != "required" {
+		return Artifact{}, fmt.Errorf("verifier scripts require AllowHostVerifier or sandbox mode required; public datasets must use their official verifier")
+	}
+	// Fail before an agent or an untrusted verifier runs if the requested
+	// isolation cannot be supplied. Explicit host permission does not weaken a
+	// separately requested required sandbox.
+	if err := sandbox.New(sandbox.Config{Mode: opts.Config.Sandbox.Mode, Backend: opts.Config.Sandbox.Backend, WorkspaceWrite: true, DenyNetwork: opts.Config.Sandbox.DenyNetwork}).Validate(); err != nil {
 		return Artifact{}, err
 	}
 	if opts.WorkspaceRoot == "" {
@@ -121,18 +134,24 @@ func Run(ctx context.Context, opts Options) (Artifact, error) {
 	}
 	return artifact, nil
 }
-func runTask(ctx context.Context, opts Options, task Task) Row {
+func runTask(ctx context.Context, opts Options, task Task) (row Row) {
 	started := time.Now()
-	row := Row{ID: task.ID, Status: "fail"}
+	row = Row{ID: task.ID, Status: "fail"}
+	defer func() { row.DurationMS = time.Since(started).Milliseconds() }()
 	src := filepath.Join(opts.FixtureRoot, task.FixtureRepo)
-	dst := filepath.Join(opts.WorkspaceRoot, task.ID, filepath.Base(task.FixtureRepo))
-	row.Workspace = dst
-	// Every task owns its workspace. Remove a previous run so stale artifacts
-	// cannot turn a failed task into a false positive on the next baseline run.
-	if err := os.RemoveAll(dst); err != nil {
-		row.FailureCategory = "workspace_reset_failed"
+	if err := os.MkdirAll(opts.WorkspaceRoot, 0700); err != nil {
+		row.FailureCategory = "workspace_create_failed"
 		return row
 	}
+	owned, err := os.MkdirTemp(opts.WorkspaceRoot, task.ID+"-")
+	if err != nil {
+		row.FailureCategory = "workspace_create_failed"
+		return row
+	}
+	// Fresh owned directories prevent stale-artifact passes without deleting a
+	// previous run or traversing a pre-existing task-ID directory symlink.
+	dst := filepath.Join(owned, filepath.Base(task.FixtureRepo))
+	row.Workspace = dst
 	if err := copyTree(src, dst); err != nil {
 		row.FailureCategory = "fixture_copy_failed"
 		return row
@@ -190,20 +209,24 @@ func runTask(ctx context.Context, opts Options, task Task) Row {
 	}
 	row.VerifierPassed = true
 	if task.Verifier != "" {
-		cmd := exec.CommandContext(ctx, "/bin/sh", "-lc", task.Verifier)
-		cmd.Dir = dst
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		if err = cmd.Run(); err != nil {
+		seconds := opts.VerifierTimeoutSeconds
+		if seconds <= 0 {
+			seconds = 60
+		}
+		runner := sandbox.New(sandbox.Config{Mode: opts.Config.Sandbox.Mode, Backend: opts.Config.Sandbox.Backend, WorkspaceWrite: true, DenyNetwork: opts.Config.Sandbox.DenyNetwork})
+		verification, verifyErr := runner.Run(ctx, task.Verifier, dst, workspace.ShellEnv(), seconds)
+		row.VerifierExitCode = verification.ExitCode
+		if verifyErr != nil || verification.ExitCode != 0 {
 			row.VerifierPassed = false
-			row.VerifierExitCode = 1
-			if exit, ok := err.(*exec.ExitError); ok {
-				row.VerifierExitCode = exit.ExitCode()
+			if verifyErr != nil {
+				row.VerifierExitCode = -1
+				verification.Stderr += "\n" + verifyErr.Error()
 			}
 		}
-		row.VerifierStdout = truncateOutput(stdout.String())
-		row.VerifierStderr = truncateOutput(stderr.String())
+		row.VerifierStdout = truncateOutput(verification.Stdout)
+		row.VerifierStderr = truncateOutput(verification.Stderr)
+		row.VerifierStdoutTruncated = verification.StdoutTruncated || len(verification.Stdout) > maxVerifierOutput
+		row.VerifierStderrTruncated = verification.StderrTruncated || len(verification.Stderr) > maxVerifierOutput
 	}
 	if task.ExpectFailure {
 		row.Passed = askErr == nil && row.RunStatus == model.StatusFailed && row.StopReason == task.ExpectedStopReason && row.WithinBudget && row.ArtifactExists && row.VerifierPassed
@@ -384,6 +407,9 @@ func treeDigest(path string) (string, error) {
 		if walkErr != nil {
 			return walkErr
 		}
+		if d.Type()&os.ModeSymlink != 0 || (!d.IsDir() && !d.Type().IsRegular()) {
+			return fmt.Errorf("cannot digest symlink or special file: %s", current)
+		}
 		if current == path || (d.IsDir() && d.Name() == ".pico") {
 			if current != path {
 				return filepath.SkipDir
@@ -424,6 +450,9 @@ func copyTree(src, dst string) error {
 		}
 		if d.IsDir() && (d.Name() == ".git" || d.Name() == ".pico") {
 			return filepath.SkipDir
+		}
+		if d.Type()&os.ModeSymlink != 0 || (!d.IsDir() && !d.Type().IsRegular()) {
+			return fmt.Errorf("fixture contains a symlink or special file: %s", rel)
 		}
 		target := filepath.Join(dst, rel)
 		if d.IsDir() {

@@ -3,28 +3,38 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/Lundomn/gopherharness/internal/contextbuilder"
 	"github.com/Lundomn/gopherharness/internal/evidence"
 	"github.com/Lundomn/gopherharness/internal/governance"
 	"github.com/Lundomn/gopherharness/internal/memory"
 	"github.com/Lundomn/gopherharness/internal/model"
-	"github.com/Lundomn/gopherharness/internal/permission"
 	"github.com/Lundomn/gopherharness/internal/protocol"
 	"github.com/Lundomn/gopherharness/internal/provider"
 	"github.com/Lundomn/gopherharness/internal/store"
+	"github.com/Lundomn/gopherharness/internal/tools"
 	"github.com/Lundomn/gopherharness/internal/tracing"
 )
 
 func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answer string, runErr error) {
+	return a.runWithContinuation(ctx, request, persistUser, nil)
+}
+func (a *Agent) runWithContinuation(ctx context.Context, request string, persistUser bool, continuation *approvalContinuation) (answer string, runErr error) {
 	request = strings.TrimSpace(request)
 	if request == "" {
 		return "", fmt.Errorf("request must not be empty")
 	}
 	runStore := store.NewRunStore(a.Workspace.Root)
+	if id, ok := ctx.Value(workerSummaryRunKey{}).(string); ok && id != "" {
+		runStore = &store.RunStore{Root: a.Workspace.Root, RunID: id, Dir: filepath.Join(a.Workspace.Root, ".pico", "runs", id)}
+	}
+	if continuation != nil {
+		runStore = &store.RunStore{Root: a.Workspace.Root, RunID: continuation.Task.RunID, Dir: filepath.Join(a.Workspace.Root, ".pico", "runs", continuation.Task.RunID)}
+	}
 	recorder := evidence.New(runStore, a.Sessions, a.Session.ID, a.Redactor)
 	tracer := tracing.New(func(record tracing.Record) error {
 		payload, err := json.Marshal(record)
@@ -42,6 +52,12 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 	a.lastRun = runStore.RunID
 	now := time.Now().UTC()
 	task := &model.TaskState{SchemaVersion: model.ArtifactSchema, RunID: runStore.RunID, TaskID: store.NewID("task"), UserRequest: request, Status: model.StatusRunning, ResumeStatus: a.ResumeStatus, StartedAt: now, UpdatedAt: now}
+	if continuation != nil {
+		restored := continuation.Task
+		task = &restored
+		task.Status = model.StatusRunning
+		now = task.StartedAt
+	}
 	if persistUser {
 		a.Session.Messages = append(a.Session.Messages, model.Message{Role: "user", Content: request, CreatedAt: now})
 	}
@@ -55,8 +71,11 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 	_ = recorder.Emit("run_started", map[string]any{"task_id": task.TaskID, "request": request})
 	started := now
 	retries := 0
-	repetitions := map[string]int{}
 	var promptMeta map[string]any
+	guard := &loopGuard{}
+	if continuation != nil {
+		*guard = continuation.Guard
+	}
 	defer func() {
 		if runErr != nil && task.Status == model.StatusRunning {
 			task.Status = model.StatusFailed
@@ -72,65 +91,100 @@ func (a *Agent) run(ctx context.Context, request string, persistUser bool) (answ
 			_ = a.writeTask(runStore, task)
 			_ = a.writeReport(runStore, task, started, promptMeta)
 		}
-		_ = a.saveSession()
 	}()
+	if continuation != nil {
+		if err := a.executeToolBatch(ctx, recorder, tracer, task, request, continuation.Calls, continuation.Blocked, guard, continuation); err != nil {
+			return "", err
+		}
+	}
+	if _, err := a.ingestWorkerResults(ctx); err != nil {
+		return "", err
+	}
+	turnPrompt, buildErr := a.prepareTurnContext(ctx, request)
+	if buildErr != nil {
+		return a.finishError(runStore, task, started, promptMeta, "context_build_failed", buildErr)
+	}
+	promptMeta = turnPrompt.meta
+	overflowRetries := 0
 
 turnLoop:
 	for task.Attempts < a.MaxAttempts {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
+		if task.ToolSteps >= a.MaxSteps {
+			guard.FinalOnly = true
+			guard.Reason = "tool step budget exhausted"
+		}
+		if guard.FinalOnly && guard.FinalCalls >= 2 {
+			break turnLoop
+		}
+		turnPrompt.finalOnly = guard.FinalOnly
+		if guard.FinalOnly {
+			guard.FinalCalls++
+		}
 		task.Attempts++
 		task.UpdatedAt = time.Now().UTC()
-		_ = a.writeTask(runStore, task)
+		if err := a.writeTask(runStore, task); err != nil {
+			return "", err
+		}
 		if received := a.drainInbox(); received > 0 {
 			_ = recorder.Emit("worker_messages_received", map[string]any{"count": received})
-			_ = a.saveSession()
-		}
-		memText := a.Memory.Render(request)
-		if facts, recallErr := a.Facts.Recall(ctx, a.FactScope, request, 5); recallErr == nil {
-			for _, f := range facts {
-				memText += fmt.Sprintf("\n- fact[%s] %s.%s=%s", f.ID, f.Subject, f.Attribute, f.Value)
-			}
-		} else {
-			_ = recorder.Emit("memory_recall_failed", map[string]any{"error": recallErr.Error()})
-		}
-		prompt, meta, buildErr := contextbuilder.BuildChecked(ctx, contextbuilder.Input{Workspace: a.Workspace.Summary(), Skills: a.Skills.Render(request), Memory: memText, History: a.Session.Messages, UserMessage: request, Tools: a.activeToolSpecs(), MaxChars: a.PromptBudget}, a.HistorySelector)
-		rawMeta, _ := json.Marshal(meta)
-		_ = json.Unmarshal(rawMeta, &promptMeta)
-		if buildErr != nil {
-			return a.finishError(runStore, task, started, promptMeta, "context_budget_exceeded", buildErr)
-		}
-		if meta.Reduced {
-			if data, e := json.Marshal(a.Session.Messages); e == nil {
-				_, _ = runStore.WriteArtifact("context-archive.json", data)
+			if err := a.saveSession(); err != nil {
+				return "", err
 			}
 		}
-		modelCtx, endModel := tracer.Start(ctx, "llm.call", false)
-		_ = recorder.EmitContext(modelCtx, "model_started", map[string]any{"attempt": task.Attempts, "prompt_chars": len(prompt)})
+		if _, err := a.ingestWorkerResults(ctx); err != nil {
+			return "", err
+		}
+		if err := turnPrompt.advance(a); err != nil {
+			return a.finishError(runStore, task, started, promptMeta, "context_budget_exceeded", err)
+		}
+		iterationCtx := tools.WithCatalog(ctx, turnPrompt.catalog)
+		modelCtx, endModel := tracer.Start(iterationCtx, "llm.call", false)
+		_ = recorder.EmitContext(modelCtx, "model_started", map[string]any{"attempt": task.Attempts, "prompt_tokens": promptMeta["prompt_tokens"], "input_budget_tokens": a.ContextWindowTokens - a.MaxNewTokens})
 		var completion provider.Completion
 		var err error
-		if stream, ok := a.Provider.(provider.StreamClient); ok && a.OnDelta != nil {
-			if a.OnModelStart != nil {
-				a.OnModelStart()
+		for {
+			completion, err = turnPrompt.complete(modelCtx, a)
+			a.modelCalls++
+			a.usageInput += completion.Usage.InputTokens
+			a.usageOutput += completion.Usage.OutputTokens
+			if !provider.ContextOverflow(err) || overflowRetries >= 2 || ctx.Err() != nil || completion.Text != "" || !turnPrompt.shrink() {
+				break
 			}
-			completion, err = stream.Stream(modelCtx, prompt, a.MaxNewTokens, a.OnDelta)
-		} else {
-			completion, err = a.Provider.Complete(modelCtx, prompt, a.MaxNewTokens)
+			overflowRetries++
+			_ = recorder.EmitContext(modelCtx, "context_overflow_recovery", map[string]any{"retry": overflowRetries, "tools_reexecuted": false})
+			if e := turnPrompt.measure(); e != nil {
+				err = e
+				break
+			}
 		}
 		endModel(err)
-		a.modelCalls++
-		a.usageInput += completion.Usage.InputTokens
-		a.usageOutput += completion.Usage.OutputTokens
 		if err != nil {
+			// Bounded wrap-up is optional after a hard stop. A provider failure
+			// here cannot replace the original tool-limit/no-progress outcome.
+			if guard.FinalOnly && ctx.Err() == nil {
+				break turnLoop
+			}
 			return a.finishError(runStore, task, started, promptMeta, model.StopModelError, fmt.Errorf("model: %w", err))
 		}
 		_ = recorder.EmitContext(modelCtx, "model_completed", map[string]any{"attempt": task.Attempts, "output_chars": len(completion.Text), "input_tokens": completion.Usage.InputTokens, "output_tokens": completion.Usage.OutputTokens})
 		parsed := protocol.Parse(completion.Text)
+		if turnPrompt.native {
+			kind, text := nativeParsed(completion)
+			parsed = protocol.Parsed{Kind: protocol.Kind(kind), Text: text, Tools: completion.ToolCalls}
+			if kind == "final" && strings.HasPrefix(text, "<final>") {
+				parsed = protocol.Parse(text)
+			}
+		}
 		switch parsed.Kind {
 		case protocol.KindRetry:
 			retries++
 			a.Session.Messages = append(a.Session.Messages, model.Message{Role: "assistant", Content: completion.Text, CreatedAt: time.Now().UTC()}, model.Message{Role: "system", Content: parsed.Text, CreatedAt: time.Now().UTC()})
+			if err := a.saveSession(); err != nil {
+				return "", err
+			}
 			_ = recorder.Emit("model_retry", map[string]any{"notice": parsed.Text})
 			if retries >= 3 {
 				return a.finishError(runStore, task, started, promptMeta, model.StopRetryLimit, fmt.Errorf("model output retry limit reached"))
@@ -143,8 +197,12 @@ turnLoop:
 				notice := governance.Notice(decision)
 				a.Session.Messages = append(a.Session.Messages, model.Message{Role: "system", Content: notice, CreatedAt: time.Now().UTC()})
 				_ = recorder.Emit("final_readiness_notice", map[string]any{"action": decision.Action, "notice": notice, "reason_signature": decision.Signature})
-				_ = a.writeTask(runStore, task)
-				_ = a.saveSession()
+				if err := a.writeTask(runStore, task); err != nil {
+					return "", err
+				}
+				if err := a.saveSession(); err != nil {
+					return "", err
+				}
 				continue
 			}
 			answer = parsed.Text
@@ -158,87 +216,63 @@ turnLoop:
 			}
 			a.Memory.SetNextStep("")
 			_ = a.Memory.Promote(answer)
-			if factErr := a.Facts.Store(ctx, a.FactScope, runStore.RunID, []memory.Evidence{{ID: runStore.RunID + "-request", Kind: "conversation", Text: a.Redactor.Text(request), ObservedAt: now}, {ID: runStore.RunID + "-answer", Kind: "model", Text: a.Redactor.Text(answer), ObservedAt: time.Now().UTC()}}); factErr != nil {
-				_ = recorder.Emit("memory_store_failed", map[string]any{"error": factErr.Error()})
+			if a.FactWriter != nil {
+				if factErr := a.FactWriter.Prepare(ctx, runStore.RunID, a.Session.ID, []memory.Evidence{{ID: runStore.RunID + "-request", Kind: "conversation", Text: a.Redactor.Text(request), ObservedAt: now}, {ID: runStore.RunID + "-answer", Kind: "model", Text: a.Redactor.Text(answer), ObservedAt: time.Now().UTC()}}); factErr != nil {
+					return a.finishError(runStore, task, started, promptMeta, model.StopPersistence, factErr)
+				}
 			}
-			a.writeCheckpoint(runStore, recorder, task, request, "")
-			_ = a.writeTask(runStore, task)
+			if err := a.writeCheckpoint(runStore, recorder, task, request, ""); err != nil {
+				return a.finishError(runStore, task, started, promptMeta, model.StopPersistence, err)
+			}
+			if e := a.saveSession(); e != nil {
+				return a.finishError(runStore, task, started, promptMeta, model.StopPersistence, e)
+			}
+			if e := a.writeTask(runStore, task); e != nil {
+				return a.finishError(runStore, task, started, promptMeta, model.StopPersistence, e)
+			}
+			if e := a.writeReport(runStore, task, started, promptMeta); e != nil {
+				return "", e
+			}
+			if a.FactWriter != nil {
+				a.FactWriter.Notify()
+			}
 			_ = recorder.Emit("run_completed", map[string]any{"stop_reason": task.StopReason})
-			a.scheduleDream(recorder)
-			return answer, a.writeReport(runStore, task, started, promptMeta)
+			a.scheduleDream(ctx, recorder)
+			return answer, nil
 		case protocol.KindTools:
 			// The tool budget does not consume the final model response. Allow
 			// summarization after the last tool, but never execute another tool.
-			if task.ToolSteps >= a.MaxSteps {
-				break turnLoop
-			}
 			calls := make([]model.ToolCall, 0, len(parsed.Tools))
 			blocked := []bool{}
-			eligible := 0
+			seenIDs := map[string]bool{}
+			for _, m := range a.Session.Messages {
+				for _, c := range m.ToolCalls {
+					seenIDs[c.ID] = true
+				}
+			}
 			for _, call := range parsed.Tools {
-				if task.ToolSteps+eligible >= a.MaxSteps {
-					break
+				if call.ID == "" {
+					call.ID = store.NewID("call")
 				}
-				sigBytes, _ := json.Marshal(call)
-				sig := string(sigBytes)
-				repetitions[sig]++
+				if seenIDs[call.ID] {
+					return a.finishError(runStore, task, started, promptMeta, "invalid_tool_call", fmt.Errorf("duplicate tool call ID"))
+				}
+				seenIDs[call.ID] = true
 				calls = append(calls, call)
-				calls[len(calls)-1].ID = store.NewID("call")
-				blocked = append(blocked, repetitions[sig] > 2)
-				if repetitions[sig] > 2 {
-					notice := "repeated identical tool call blocked"
-					_ = recorder.Emit("tool_blocked", map[string]any{"tool_name": call.Name, "reason": notice})
-					continue
-				}
-				eligible++
+				blocked = append(blocked, guard.FinalOnly || task.ToolSteps+len(calls) > a.MaxSteps)
 			}
-			a.Session.Messages = append(a.Session.Messages, model.Message{ID: store.NewID("message"), Role: "assistant", Content: completion.Text, ToolCalls: calls, CreatedAt: time.Now().UTC()})
-			results := a.Tools.RunIndexedBatch(ctx, calls, 4, func(toolCtx context.Context, index int, call model.ToolCall) model.ToolResult {
-				if blocked[index] {
-					return model.ToolResult{Name: call.Name, Status: "error", Error: "repeated identical tool call blocked", ErrorCode: "repeated_call"}
-				}
-				toolCtx, endTool := tracer.Start(toolCtx, "tool."+call.Name, false)
-				result := a.executeTool(toolCtx, recorder, call)
-				var toolErr error
-				if result.Status != "ok" {
-					toolErr = fmt.Errorf("%s", result.Error)
-				}
-				if toolCtx.Err() != nil {
-					toolErr = toolCtx.Err()
-					result.Status = "error"
-					result.Error = toolErr.Error()
-					result.ErrorCode = "cancelled"
-				}
-				endTool(toolErr)
-				return result
-			})
-			for index, result := range results {
-				call := calls[index]
-				if !blocked[index] {
-					task.ToolSteps++
-				}
-				task.LastTool = call.Name
-				task.UpdatedAt = time.Now().UTC()
-				_ = a.writeTask(runStore, task)
-				content := renderToolResult(result)
-				a.Session.Messages = append(a.Session.Messages, model.Message{ID: store.NewID("message"), ToolCallID: call.ID, Role: "tool", Content: content, CreatedAt: time.Now().UTC()})
-				if call.Name == "read_file" && result.Status == "ok" {
-					a.Memory.ObserveFile(fmt.Sprint(call.Args["path"]), result.Output)
-				}
-				if len(result.AffectedPaths) > 0 {
-					task.ChangedPaths = appendUnique(task.ChangedPaths, result.AffectedPaths...)
-					task.VerificationAttempted = false
-					task.VerificationSucceeded = false
-					a.Memory.AddNote("Changed: "+strings.Join(result.AffectedPaths, ", "), "workspace_change", call.Name)
-				}
-				if call.Name == "run_shell" && governance.IsVerificationCommand(fmt.Sprint(call.Args["command"])) {
-					task.VerificationAttempted = true
-					task.VerificationSucceeded = result.Status == "ok" && strings.Contains(result.Output, "exit_code: 0")
-					_ = recorder.Emit("verification_completed", map[string]any{"command": call.Args["command"], "succeeded": task.VerificationSucceeded})
+			if a.AsyncApproval {
+				if err := a.freezeableCalls(calls); err != nil {
+					return "", err
 				}
 			}
-			a.writeCheckpoint(runStore, recorder, task, request, "continue from the latest tool results")
-			_ = a.saveSession()
+			a.Session.Messages = append(a.Session.Messages, model.Message{ID: store.NewID("message"), Role: "assistant", Content: completion.Text, ToolCalls: calls, NativeContent: completion.NativeContent, CreatedAt: time.Now().UTC()})
+			if err := a.saveSession(); err != nil {
+				return a.finishError(runStore, task, started, promptMeta, model.StopPersistence, err)
+			}
+			if err := a.executeToolBatch(iterationCtx, recorder, tracer, task, request, calls, blocked, guard, nil); err != nil {
+				return "", err
+			}
 		}
 	}
 	task.Status = model.StatusFailed
@@ -248,13 +282,35 @@ turnLoop:
 		task.StopReason = model.StopAttemptLimit
 		task.FinalAnswer = "Stopped after reaching the configured model-attempt limit."
 	}
+	if guard.FinalOnly && guard.Reason != "tool step budget exhausted" {
+		task.StopReason = "repeated_tool_failure"
+		task.FinalAnswer = "Stopped after repeated identical tool failures and bounded final-answer attempts."
+	}
 	task.UpdatedAt = time.Now().UTC()
-	_ = a.writeTask(runStore, task)
+	if err := a.writeTask(runStore, task); err != nil {
+		return "", err
+	}
 	_ = recorder.Emit("run_completed", map[string]any{"stop_reason": task.StopReason})
 	return task.FinalAnswer, a.writeReport(runStore, task, started, promptMeta)
 }
 
-func (a *Agent) executeTool(ctx context.Context, recorder *evidence.Recorder, call model.ToolCall) model.ToolResult {
+func (a *Agent) executeTool(ctx context.Context, recorder *evidence.Recorder, call model.ToolCall) (result model.ToolResult) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			result = model.ToolResult{Name: call.Name, Status: "error", Error: fmt.Sprintf("tool panicked; outcome requires reconciliation: %v", recovered), ErrorCode: "effect_unknown"}
+		}
+		event := "tool_completed"
+		if result.Status == "pending" {
+			event = "tool_paused"
+		}
+		_ = recorder.EmitContext(ctx, event, map[string]any{"tool_name": call.Name, "call_id": call.ID, "status": result.Status, "error_code": result.ErrorCode, "affected_paths": result.AffectedPaths, "metadata": result.Metadata})
+	}()
+	limit := 300 * time.Second
+	if call.Name == "run_shell" {
+		limit = 660 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return model.ToolResult{Name: call.Name, Status: "error", Error: err.Error(), ErrorCode: "cancelled"}
 	}
@@ -262,29 +318,51 @@ func (a *Agent) executeTool(ctx context.Context, recorder *evidence.Recorder, ca
 	if !a.toolAllowed(call.Name) {
 		return a.denied(recorder, call, "tool is not allowed by the active profile", "tool_not_allowed")
 	}
-	spec, ok := a.Tools.Spec(call.Name)
-	if !ok {
-		return model.ToolResult{Name: call.Name, Status: "error", Error: "unknown tool", ErrorCode: "unknown_tool"}
+	invocation, prepareErr := a.Tools.PrepareContext(ctx, call)
+	if prepareErr != nil {
+		return a.denied(recorder, call, prepareErr.Error(), "invalid_or_changed_tool")
 	}
+	call, spec := invocation.Call, invocation.Spec
 	if err := a.planAllows(call); err != nil {
 		return a.denied(recorder, call, err.Error(), "plan_mode")
 	}
-	decision := permission.Check(a.Approval, spec.Risky, call.Name, call.Args, a.Approver)
-	if !decision.Allowed {
-		return a.denied(recorder, call, decision.Reason, decision.SecurityEvent)
+	var err error
+	finishApproval, approvalErr := a.authorizeTool(ctx, recorder, call, spec)
+	if approvalErr != nil {
+		var replay *replayedToolResult
+		if errors.As(approvalErr, &replay) {
+			return a.boundToolResult(recorder, replay.Result)
+		}
+		var pending *PendingApprovalError
+		if errors.As(approvalErr, &pending) {
+			return model.ToolResult{Name: call.Name, Status: "pending", Error: pending.Reason, ErrorCode: "approval_pending", Metadata: map[string]any{"approval_id": pending.ApprovalID}}
+		}
+		return a.denied(recorder, call, approvalErr.Error(), "approval_denied")
 	}
-	result := a.Tools.Run(ctx, a, call)
-	if len(result.Output) > 12000 {
-		path, err := recorder.Run.WriteArtifact(store.NewID(call.Name)+"-full-output.txt", []byte(result.Output))
+	if err := ctx.Err(); err != nil {
+		return a.denied(recorder, call, err.Error(), "cancelled")
+	}
+	if err = a.preflightPath(call); err != nil {
+		return a.denied(recorder, call, err.Error(), "path_precondition")
+	}
+	result = finishApproval(invocation.Run(ctx, a))
+	return a.boundToolResult(recorder, result)
+}
+func (a *Agent) boundToolResult(recorder *evidence.Recorder, result model.ToolResult) model.ToolResult {
+	runes := []rune(result.Output)
+	if len(runes) > 16000 {
+		path, err := recorder.Run.WriteArtifact(store.NewID(result.Name)+"-full-output.txt", []byte(a.Redactor.Text(result.Output)))
 		if err == nil {
 			if result.Metadata == nil {
 				result.Metadata = map[string]any{}
 			}
 			result.Metadata["full_output_artifact"] = path
-			result.Output = result.Output[:12000] + "\n...[full output written to artifact]"
+			result.Output = string(runes[:16000]) + "\n...[full output written to artifact]"
+		}
+		if err != nil {
+			result.Output = string(runes[:16000]) + "\n...[output truncated; full artifact persistence failed]"
 		}
 	}
-	_ = recorder.EmitContext(ctx, "tool_completed", map[string]any{"tool_name": call.Name, "status": result.Status, "error_code": result.ErrorCode, "affected_paths": result.AffectedPaths, "metadata": result.Metadata})
 	return result
 }
 func (a *Agent) denied(recorder *evidence.Recorder, call model.ToolCall, reason, code string) model.ToolResult {
@@ -356,10 +434,17 @@ func readinessPayload(decision governance.Decision) map[string]any {
 	return map[string]any{"mode": decision.Mode, "decision": decision.Decision, "action": decision.Action, "reasons": reasons, "reason_signature": decision.Signature}
 }
 
-func (a *Agent) writeCheckpoint(runStore *store.RunStore, recorder *evidence.Recorder, task *model.TaskState, goal, nextStep string) {
-	checkpoint := model.Checkpoint{SchemaVersion: model.CheckpointSchema, ID: store.NewID("ckpt"), RunID: runStore.RunID, Goal: goal, NextStep: nextStep, WorkspaceHash: a.Workspace.Fingerprint(), CreatedAt: time.Now().UTC()}
-	task.CheckpointID = checkpoint.ID
+func (a *Agent) writeCheckpoint(runStore *store.RunStore, recorder *evidence.Recorder, task *model.TaskState, goal, nextStep string) error {
+	fingerprint, err := a.Workspace.FingerprintChecked()
+	if err != nil {
+		return err
+	}
+	checkpoint := model.Checkpoint{SchemaVersion: model.CheckpointSchema, ID: store.NewID("ckpt"), RunID: runStore.RunID, Goal: a.Redactor.Text(goal), NextStep: a.Redactor.Text(nextStep), WorkspaceHash: fingerprint, CreatedAt: time.Now().UTC()}
 	checkpoint.SessionID = a.Session.ID
-	_ = runStore.WriteCheckpoint(checkpoint)
+	if err := runStore.WriteCheckpoint(checkpoint); err != nil {
+		return err
+	}
+	task.CheckpointID = checkpoint.ID
 	_ = recorder.Emit("checkpoint_created", map[string]any{"checkpoint_id": checkpoint.ID, "workspace_fingerprint": checkpoint.WorkspaceHash})
+	return nil
 }

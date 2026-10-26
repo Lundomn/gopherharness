@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/Lundomn/gopherharness/internal/config"
+	"github.com/Lundomn/gopherharness/internal/model"
 	"sync"
 )
 
@@ -17,9 +18,12 @@ type Usage struct {
 }
 
 type Completion struct {
-	Text        string `json:"text"`
-	Usage       Usage  `json:"usage"`
-	ActualModel string `json:"actual_model,omitempty"`
+	Text          string             `json:"text"`
+	Usage         Usage              `json:"usage"`
+	ActualModel   string             `json:"actual_model,omitempty"`
+	ToolCalls     []model.ToolCall   `json:"tool_calls,omitempty"`
+	NativeContent []model.NativeItem `json:"native_content,omitempty"`
+	StopReason    string             `json:"stop_reason,omitempty"`
 }
 
 type Client interface {
@@ -27,6 +31,10 @@ type Client interface {
 	Name() string
 	Model() string
 }
+
+// ContextProfiler is optional for injected/test clients. Network clients expose
+// their configured model policy so fallback admission can use the smallest window.
+type ContextProfiler interface{ ContextPolicy() (int, int, string) }
 
 // VisionClient is implemented by providers that accept inline image input.
 type VisionClient interface {

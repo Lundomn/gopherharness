@@ -9,7 +9,7 @@ import (
 
 func TestBuiltinRegistryIsComplete(t *testing.T) {
 	registry := NewRegistry()
-	if got := len(registry.Specs()); got != 16 {
+	if got := len(registry.Specs()); got != 17 {
 		t.Fatalf("got %d builtin tools", got)
 	}
 	for _, spec := range registry.Specs() {

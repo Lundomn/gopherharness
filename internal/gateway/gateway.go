@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 
 	"github.com/Lundomn/gopherharness/internal/delivery"
@@ -15,8 +16,9 @@ import (
 )
 
 type Event struct {
-	ID      string
-	Request scheduler.Request
+	ID       string
+	Request  scheduler.Request
+	Identity tracing.Identity // persisted across inbox replay and outbox delivery
 }
 type Gateway struct {
 	Journal   *journal.Journal // Startup-only; adapter must call Replay before intake.
@@ -41,11 +43,17 @@ func New(s *scheduler.Scheduler, hub *delivery.Hub, allowed func(scheduler.Sourc
 	return &Gateway{Scheduler: s, Hub: hub, Allowed: allowed, ctx: ctx, cancel: cancel, seen: map[string]bool{}, slots: make(chan struct{}, 128), onError: onError, closeDone: make(chan struct{})}
 }
 func (g *Gateway) Publish(event Event) error {
+	return g.publish(g.ctx, event, false)
+}
+func (g *Gateway) publish(ctx context.Context, event Event, wait bool) error {
 	if g.Allowed == nil || !g.Allowed(event.Request.Source) {
 		return errors.New("sender not allowed")
 	}
 	if event.ID == "" {
 		return errors.New("platform event id required")
+	}
+	if event.Request.Source.Channel == "" || event.Request.Source.ChatID == "" || strings.TrimSpace(event.Request.Text) == "" {
+		return errors.New("channel, reply target and non-empty text required")
 	}
 	key := event.Request.Source.Channel + ":" + event.ID
 	g.mu.Lock()
@@ -63,7 +71,31 @@ func (g *Gateway) Publish(event Event) error {
 	select {
 	case g.slots <- struct{}{}:
 	default:
-		return errors.New("gateway overloaded")
+		if !wait {
+			return errors.New("gateway overloaded")
+		}
+		// Startup replay obeys the same capacity bound without failing simply
+		// because more than one batch was durably accepted before restart.
+		g.mu.Unlock()
+		select {
+		case g.slots <- struct{}{}:
+			g.mu.Lock()
+			if g.closed || g.seen[key] {
+				<-g.slots
+				if g.closed {
+					return errors.New("gateway closed")
+				}
+				return nil
+			}
+		case <-ctx.Done():
+			g.mu.Lock()
+			return ctx.Err()
+		}
+	}
+	if event.Identity.TraceID == "" {
+		traceCtx, end := tracing.New(nil).Start(g.ctx, "gateway.request", true)
+		event.Identity = tracing.Current(traceCtx)
+		end(nil)
 	}
 	if g.Journal != nil {
 		created, err := g.Journal.Put(g.ctx, "inbox", key, event)
@@ -80,6 +112,10 @@ func (g *Gateway) Publish(event Event) error {
 			pending := false
 			for _, entry := range entries {
 				if entry.ID == key {
+					if e = json.Unmarshal(entry.Payload, &event); e != nil {
+						<-g.slots
+						return e
+					}
 					pending = true
 					break
 				}
@@ -88,14 +124,21 @@ func (g *Gateway) Publish(event Event) error {
 				<-g.slots
 				return nil
 			}
+			if !g.Allowed(event.Request.Source) {
+				<-g.slots
+				return errors.New("persisted sender is no longer allowed")
+			}
 		}
 	}
-	traceCtx, end := tracing.New(nil).Start(g.ctx, "gateway.request", true)
-	id := tracing.Current(traceCtx)
+	id := event.Identity
+	if id.TraceID == "" { // Compatibility for inbox entries written before trace persistence.
+		traceCtx, end := tracing.New(nil).Start(g.ctx, "gateway.replay", true)
+		id = tracing.Current(traceCtx)
+		end(nil)
+	}
 	// Only carry the trace here; the runtime records the actual turn span.
 	id.SpanID = ""
 	requestCtx := tracing.Attach(g.ctx, id)
-	end(nil)
 	if g.Journal != nil {
 		if err := g.Journal.Move(g.ctx, "inbox", key, "pending", "running", nil); err != nil {
 			<-g.slots
@@ -179,41 +222,10 @@ func (g *Gateway) Replay(ctx context.Context) error {
 		}
 		// Publish accepts a fresh receipt; remove no records. Requeue through a
 		// dedicated claim path by marking the existing record ready for retry.
-		if err = g.replayEvent(ctx, e.ID, event); err != nil {
+		if err = g.publish(ctx, event, true); err != nil {
 			return err
 		}
 	}
-	return nil
-}
-func (g *Gateway) replayEvent(ctx context.Context, key string, event Event) error {
-	if err := g.Journal.Move(ctx, "inbox", key, "pending", "running", nil); err != nil {
-		return err
-	}
-	h, err := g.Scheduler.Submit(g.ctx, event.Request)
-	if err != nil {
-		_ = g.Journal.Move(ctx, "inbox", key, "running", "pending", nil)
-		return err
-	}
-	g.wg.Add(1)
-	go func() {
-		defer g.wg.Done()
-		text, e := h.Wait(g.ctx)
-		if e != nil {
-			_ = g.Journal.Move(context.Background(), "inbox", key, "running", "needs_reconcile", nil)
-			return
-		}
-		if h.Merged() {
-			_ = g.Journal.Move(g.ctx, "inbox", key, "running", "merged", nil)
-			return
-		}
-		m := delivery.Message{ID: key, Source: event.Request.Source, Text: text}
-		if e = g.Journal.Complete(g.ctx, key, m); e == nil {
-			e = g.Hub.Post(g.ctx, m)
-		}
-		if e != nil && g.onError != nil {
-			g.onError(e)
-		}
-	}()
 	return nil
 }
 func (g *Gateway) Close(ctx context.Context) error {

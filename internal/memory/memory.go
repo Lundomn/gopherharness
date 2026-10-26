@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Lundomn/gopherharness/internal/durable"
 )
 
 type FileSummary struct {
@@ -33,6 +35,7 @@ type State struct {
 
 type Manager struct {
 	root, path string
+	dataDir    string
 	mu         sync.RWMutex
 	state      State
 }
@@ -42,6 +45,22 @@ func Open(root string) (*Manager, error) {
 }
 func OpenScoped(root, scope string) (*Manager, error) {
 	return openPath(root, filepath.Join(root, ".pico", "memory", "working-"+digest(scope)+".json"))
+}
+func OpenScopedUser(root, scope, user string) (*Manager, error) {
+	m, err := OpenScoped(root, scope)
+	if err != nil {
+		return nil, err
+	}
+	if user != "" && user != "local" {
+		m.dataDir = filepath.Join(root, ".pico", "memory", "users", digest(user))
+	}
+	return m, nil
+}
+func (m *Manager) memoryDir() string {
+	if m.dataDir != "" {
+		return m.dataDir
+	}
+	return filepath.Join(m.root, ".pico", "memory")
 }
 func openPath(root, path string) (*Manager, error) {
 	m := &Manager{root: root, path: path, state: State{FileSummaries: map[string]FileSummary{}}}
@@ -117,7 +136,7 @@ func (m *Manager) saveLocked() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.path, append(b, '\n'), 0o600)
+	return durable.Replace(m.path, append(b, '\n'))
 }
 
 func (m *Manager) Render(query string) string {
@@ -154,7 +173,7 @@ func (m *Manager) Promote(final string) error {
 	if len(durable) == 0 {
 		return nil
 	}
-	dir := filepath.Join(m.root, ".pico", "memory", "topics")
+	dir := filepath.Join(m.memoryDir(), "topics")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}

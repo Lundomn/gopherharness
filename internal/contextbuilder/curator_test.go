@@ -13,6 +13,7 @@ func TestProtectedBudgetFailsClosedIncludingSkills(t *testing.T) {
 	for _, input := range []Input{
 		{UserMessage: strings.Repeat("x", 2000), MaxChars: 1000},
 		{UserMessage: "q", Skills: strings.Repeat("x", 2000), MaxChars: 1000},
+		{UserMessage: "q", Memory: strings.Repeat("x", 2000), MaxChars: 1000},
 		{UserMessage: "q", History: []model.Message{{Role: "user", Content: strings.Repeat("x", 2000)}}, MaxChars: 1000},
 	} {
 		prompt, meta, err := BuildChecked(context.Background(), input, nil)
@@ -24,7 +25,7 @@ func TestProtectedBudgetFailsClosedIncludingSkills(t *testing.T) {
 
 func TestInvalidModelSelectionFallsBackAndCannotRemoveProtected(t *testing.T) {
 	input := Input{UserMessage: "target", MaxChars: 1500, History: []model.Message{
-		{Role: "user", Content: "initial"}, {Role: "user", Content: strings.Repeat("irrelevant", 300)},
+		{Role: "user", Content: "initial"}, {Role: "user", Content: "head2"}, {Role: "user", Content: "head3"}, {Role: "user", Content: "head4"}, {Role: "user", Content: "head5"}, {Role: "user", Content: "head6"}, {Role: "user", Content: strings.Repeat("irrelevant", 300)},
 		{Role: "assistant", Content: "OLD_TOOL_CALL_MARKER"}, {Role: "tool", Content: "OLD_TOOL_RESULT_MARKER"}, {Role: "user", Content: "recent"}, {Role: "user", Content: "current"},
 	}}
 	for _, selection := range [][]Selection{{{ID: 999, Score: 1}}, {{ID: 1, Score: 2}}, {{ID: 1, Score: 0.2}, {ID: 1, Score: 0.5}}} {

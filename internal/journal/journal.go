@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,14 +17,73 @@ import (
 )
 
 type Entry struct {
-	ID        string          `json:"id"`
-	Kind      string          `json:"kind"`
-	State     string          `json:"state"`
-	Payload   json.RawMessage `json:"payload"`
-	Result    json.RawMessage `json:"result,omitempty"`
-	Epoch     uint64          `json:"epoch"`
-	UpdatedAt time.Time       `json:"updated_at"`
+	ID          string          `json:"id"`
+	Kind        string          `json:"kind"`
+	State       string          `json:"state"`
+	Payload     json.RawMessage `json:"payload"`
+	Result      json.RawMessage `json:"result,omitempty"`
+	Epoch       uint64          `json:"epoch"`
+	UpdatedAt   time.Time       `json:"updated_at"`
+	Resolutions []Resolution    `json:"resolutions,omitempty"`
 }
+
+// Resolution is an operator decision, not an automated retry heuristic.
+// Evidence describes the external receipt/query or the manual verification.
+type Resolution struct {
+	Actor    string    `json:"actor"`
+	Reason   string    `json:"reason"`
+	Evidence string    `json:"evidence"`
+	Action   string    `json:"action"`
+	Receipt  string    `json:"receipt,omitempty"`
+	At       time.Time `json:"at"`
+}
+
+// Resolve settles only unknown outcomes. It never reruns an inbound turn. A
+// delivery retry requires an explicit confirmed_not_sent decision, recorded
+// together with its operator and evidence in the same durable transaction.
+func (j *Journal) Resolve(ctx context.Context, kind, id string, decision Resolution, recoveredMessage any) error {
+	if strings.TrimSpace(decision.Actor) == "" || strings.TrimSpace(decision.Reason) == "" || strings.TrimSpace(decision.Evidence) == "" {
+		return errors.New("reconciliation requires operator, reason and evidence")
+	}
+	var recovered []byte
+	var err error
+	if recoveredMessage != nil {
+		recovered, err = json.Marshal(recoveredMessage)
+		if err != nil {
+			return err
+		}
+	}
+	return j.mutate(ctx, func(s *State) error {
+		k := key(kind, id)
+		e, ok := s.Entries[k]
+		if !ok || !((kind == "outbox" && e.State == "unknown") || (kind == "inbox" && e.State == "needs_reconcile")) {
+			return errors.New("record is not an unresolved outcome")
+		}
+		decision.At = time.Now().UTC()
+		switch {
+		case decision.Action == "abandon":
+			e.State = "abandoned"
+		case kind == "outbox" && decision.Action == "delivered" && strings.TrimSpace(decision.Receipt) != "":
+			e.State = "delivered"
+			e.Result, _ = json.Marshal(map[string]string{"MessageID": decision.Receipt})
+		case kind == "outbox" && decision.Action == "confirmed_not_sent":
+			e.State = "pending"
+		case kind == "inbox" && decision.Action == "recover_result" && len(recovered) > 0:
+			if _, exists := s.Entries[key("outbox", id)]; exists {
+				return errors.New("outbound result already exists")
+			}
+			e.State, e.Result = "completed", recovered
+			s.Entries[key("outbox", id)] = Entry{ID: id, Kind: "outbox", State: "pending", Payload: recovered, Epoch: j.epoch, UpdatedAt: decision.At}
+		default:
+			return errors.New("invalid reconciliation decision or missing receipt/result")
+		}
+		e.Resolutions = append(e.Resolutions, decision)
+		e.UpdatedAt = decision.At
+		s.Entries[k] = e
+		return nil
+	})
+}
+
 type State struct {
 	Epoch   uint64
 	Entries map[string]Entry
@@ -77,6 +137,17 @@ func (j *Journal) mutate(ctx context.Context, fn func(*State) error) error {
 	})
 }
 func key(kind, id string) string { return kind + ":" + id }
+
+// Get returns the immutable payload and current delivery state for a stable ID.
+func (j *Journal) Get(ctx context.Context, kind, id string) (Entry, bool, error) {
+	s, err := j.File.Read(ctx)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	e, ok := s.Entries[key(kind, id)]
+	return e, ok, nil
+}
+
 func (j *Journal) Put(ctx context.Context, kind, id string, payload any) (bool, error) {
 	if id == "" || kind == "" {
 		return false, errors.New("journal identity required")

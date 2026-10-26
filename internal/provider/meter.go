@@ -2,8 +2,11 @@ package provider
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/Lundomn/gopherharness/internal/config"
 	"os"
 	"path/filepath"
 	"sync"
@@ -15,6 +18,7 @@ import (
 // Price is explicitly configured per million tokens; no guessed live prices.
 type Price struct{ Input, Output, CacheRead, CacheWrite float64 }
 type CallRecord struct {
+	AttemptID       string           `json:"attempt_id"`
 	RequestedModel  string           `json:"requested_model"`
 	AttemptedModel  string           `json:"attempted_model"`
 	ActualModel     string           `json:"actual_model,omitempty"`
@@ -125,6 +129,12 @@ func Meter(delegate Client, ledger *Ledger, prices map[string]Price) *Metered {
 }
 func (m *Metered) Name() string  { return m.Delegate.Name() }
 func (m *Metered) Model() string { return m.Delegate.Model() }
+func (m *Metered) ContextPolicy() (int, int, string) {
+	if p, ok := m.Delegate.(ContextProfiler); ok {
+		return p.ContextPolicy()
+	}
+	return (config.Provider{}).ContextPolicy()
+}
 func (m *Metered) record(ctx context.Context, result Completion, err error, stream bool) {
 	outcome := "success"
 	switch {
@@ -146,7 +156,14 @@ func (m *Metered) record(ctx context.Context, result Completion, err error, stre
 		value := (float64(result.Usage.InputTokens)*price.Input + float64(result.Usage.OutputTokens)*price.Output + float64(result.Usage.CacheReadTokens)*price.CacheRead + float64(result.Usage.CacheWriteTokens)*price.CacheWrite) / 1e6
 		cost = &value
 	}
-	m.Ledger.Append(CallRecord{RequestedModel: requestedModel(ctx, m.Model()), AttemptedModel: m.Model(), ActualModel: result.ActualModel, AccountingModel: accounting, Identity: tracing.Current(ctx), Usage: result.Usage, Outcome: outcome, Cost: cost, ObservedAt: time.Now().UTC()})
+	id := BudgetAttemptID(ctx)
+	if id == "" {
+		var b [16]byte
+		if _, e := rand.Read(b[:]); e == nil {
+			id = hex.EncodeToString(b[:])
+		}
+	}
+	m.Ledger.Append(CallRecord{AttemptID: id, RequestedModel: requestedModel(ctx, m.Model()), AttemptedModel: m.Model(), ActualModel: result.ActualModel, AccountingModel: accounting, Identity: tracing.Current(ctx), Usage: result.Usage, Outcome: outcome, Cost: cost, ObservedAt: time.Now().UTC()})
 }
 func (m *Metered) Complete(ctx context.Context, prompt string, max int) (Completion, error) {
 	r, err := m.Delegate.Complete(ctx, prompt, max)

@@ -1,14 +1,17 @@
 package memory
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 	"time"
+
+	"github.com/Lundomn/gopherharness/internal/durable"
 )
 
 type DreamState struct {
@@ -21,8 +24,8 @@ type DreamState struct {
 
 func (m *Manager) LastDreamAt() time.Time {
 	var state DreamState
-	b, err := os.ReadFile(filepath.Join(m.root, ".pico", "memory", "dream-state.json"))
-	if err != nil || json.Unmarshal(b, &state) != nil || state.Status != "finished" {
+	b, err := os.ReadFile(filepath.Join(m.memoryDir(), "dream-state.json"))
+	if err != nil || json.Unmarshal(b, &state) != nil {
 		return time.Time{}
 	}
 	return state.LastRun
@@ -40,28 +43,16 @@ func (m *Manager) DreamDue(sessionCount, minSessions int, interval time.Duration
 }
 
 func (m *Manager) AcquireDream() (func(), error) {
-	path := filepath.Join(m.root, ".pico", "memory", ".consolidate-lock")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
+	path := filepath.Join(m.memoryDir(), ".consolidate-lock")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	release, err := durable.Lease(ctx, path)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return nil, fmt.Errorf("dream lock is already held")
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-	if err != nil {
-		if os.IsExist(err) {
-			if !staleDreamLock(path) {
-				return nil, fmt.Errorf("dream lock is already held")
-			}
-			if removeErr := os.Remove(path); removeErr != nil && !os.IsNotExist(removeErr) {
-				return nil, removeErr
-			}
-			f, err = os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-	_, _ = fmt.Fprintf(f, "%d\n", os.Getpid())
-	_ = f.Close()
-	return func() { _ = os.Remove(path) }, nil
+	// Do not delete lock files or steal by mtime/PID: the kernel releases the
+	// lock on process death and a live owner may legitimately be slow.
+	return release, err
 }
 
 func (m *Manager) FinishDream(content string, sessionCount int) (string, error) {
@@ -69,59 +60,43 @@ func (m *Manager) FinishDream(content string, sessionCount int) (string, error) 
 	if content == "" {
 		return "", fmt.Errorf("dream produced no durable content")
 	}
-	dir := filepath.Join(m.root, ".pico", "memory", "topics")
+	dir := filepath.Join(m.memoryDir(), "topics")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
 	path := filepath.Join(dir, "dream.md")
 	section := fmt.Sprintf("\n## %s\n%s\n", time.Now().UTC().Format(time.RFC3339), content)
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	release, err := durable.Lease(context.Background(), path+".lock")
 	if err != nil {
 		return "", err
 	}
-	if _, err = f.WriteString(section); err != nil {
-		_ = f.Close()
+	defer release()
+	previous, err := os.ReadFile(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	if err = f.Close(); err != nil {
+	if err = durable.Replace(path, append(previous, []byte(section)...)); err != nil {
 		return "", err
 	}
 	now := time.Now().UTC()
 	state := DreamState{LastRun: now, LastAttempt: now, SessionCount: sessionCount, Status: "finished"}
 	b, _ := json.MarshalIndent(state, "", "  ")
-	if err = os.WriteFile(filepath.Join(m.root, ".pico", "memory", "dream-state.json"), append(b, '\n'), 0o600); err != nil {
+	if err = durable.Replace(filepath.Join(m.memoryDir(), "dream-state.json"), append(b, '\n')); err != nil {
 		return "", err
 	}
-	return filepath.ToSlash(filepath.Join(".pico", "memory", "topics", "dream.md")), nil
+	rel, err := filepath.Rel(m.root, path)
+	return filepath.ToSlash(rel), err
 }
 
 func (m *Manager) RecordDreamFailure(sessionCount int, dreamErr error) {
-	state := DreamState{LastAttempt: time.Now().UTC(), SessionCount: sessionCount, Status: "failed", Error: dreamErr.Error()}
-	b, _ := json.MarshalIndent(state, "", "  ")
-	_ = os.WriteFile(filepath.Join(m.root, ".pico", "memory", "dream-state.json"), append(b, '\n'), 0o600)
-}
-
-func staleDreamLock(path string) bool {
-	info, err := os.Stat(path)
-	if err != nil {
-		return true
-	}
-	if time.Since(info.ModTime()) > 6*time.Hour {
-		return true
-	}
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	var pid int
-	if _, err = fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); err != nil || pid <= 0 {
-		return true
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return true
-	}
-	return process.Signal(syscall.Signal(0)) != nil
+	f := durable.File[DreamState]{Path: filepath.Join(m.memoryDir(), "dream-state.json")}
+	_ = f.Update(context.Background(), func(state *DreamState) error {
+		state.LastAttempt = time.Now().UTC()
+		state.SessionCount = sessionCount
+		state.Status = "failed"
+		state.Error = dreamErr.Error()
+		return nil
+	})
 }
 
 func sanitizeDream(value string) string {

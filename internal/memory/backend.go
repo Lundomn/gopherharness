@@ -201,7 +201,8 @@ func (b *FactBackend) Store(ctx context.Context, scope Scope, session string, ev
 	if err != nil {
 		return err
 	}
-	key := scope.Repo + ":" + scope.User + ":" + session
+	keyBytes, _ := json.Marshal([]string{scope.Repo, scope.User, session})
+	key := string(keyBytes)
 	if state.Sessions[key] {
 		return nil
 	}
@@ -220,9 +221,9 @@ func (b *FactBackend) Store(ctx context.Context, scope Scope, session string, ev
 		if s.Sessions[key] {
 			return nil
 		}
-		if s.Revision != state.Revision {
-			return ErrRevision
-		}
+		// Extraction is performed outside the transaction. Merge against the
+		// latest facts under lock: unrelated concurrent writes need not rerun a
+		// paid extraction; applyFacts re-evaluates authority/conflicts here.
 		if err := applyFacts(s, scope, candidates, sources); err != nil {
 			return err
 		}

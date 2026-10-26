@@ -1,9 +1,11 @@
 package workspace
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -96,53 +98,116 @@ func (w *Workspace) Relative(path string) string {
 }
 
 func (w *Workspace) MarkRead(path string) {
-	digest, _ := fileDigest(path)
-	w.mu.Lock()
-	w.reads[path] = digest
-	w.mu.Unlock()
+	// Compatibility for legacy hosts. New tool reads use ReadSnapshot so the
+	// digest is derived from the exact bytes returned, not a second read.
+	_, _ = w.ReadSnapshot(context.Background(), path)
 }
 
 func (w *Workspace) FreshRead(path string) bool {
-	digest, err := fileDigest(path)
+	key, rel, err := w.canonical(path)
+	if err != nil {
+		return false
+	}
+	data, err := w.read(context.Background(), rel)
 	if err != nil {
 		return false
 	}
 	w.mu.RLock()
-	prior, ok := w.reads[path]
+	prior, ok := w.reads[key]
 	w.mu.RUnlock()
-	return ok && prior == digest
+	return ok && prior == bytesDigest(data)
 }
 
-func (w *Workspace) Invalidate(path string) { w.mu.Lock(); delete(w.reads, path); w.mu.Unlock() }
+func (w *Workspace) Invalidate(path string) {
+	key, _, err := w.canonical(path)
+	if err != nil {
+		key = path
+	}
+	w.mu.Lock()
+	delete(w.reads, key)
+	w.mu.Unlock()
+}
 
 func (w *Workspace) Fingerprint() string {
+	digest, err := w.FingerprintChecked()
+	if err != nil {
+		return ""
+	}
+	return digest
+}
+
+// FingerprintChecked includes content, type and permission metadata. A missing
+// or unreadable entry is an error, never silently a matching workspace.
+func (w *Workspace) FingerprintChecked() (string, error) {
+	r, err := os.OpenRoot(w.Root)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
 	h := sha256.New()
-	_ = filepath.WalkDir(w.Root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
+	err = fs.WalkDir(r.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == "." {
 			return nil
 		}
-		if path == w.Root {
-			return nil
-		}
-		rel, _ := filepath.Rel(w.Root, path)
-		parts := strings.Split(rel, string(filepath.Separator))
+		parts := strings.Split(path, "/")
 		if ignored[parts[0]] {
 			if d.IsDir() {
-				return filepath.SkipDir
+				return fs.SkipDir
 			}
-			return nil
-		}
-		if d.IsDir() {
 			return nil
 		}
 		info, err := d.Info()
 		if err != nil {
+			return err
+		}
+		fmt.Fprintf(h, "%q:%s:", path, info.Mode().String())
+		if d.Type()&os.ModeSymlink != 0 {
+			target, err := r.Readlink(filepath.FromSlash(path))
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(h, "%q\n", target)
 			return nil
 		}
-		fmt.Fprintf(h, "%s:%d:%d\n", filepath.ToSlash(rel), info.Size(), info.ModTime().UnixNano())
+		if d.IsDir() {
+			fmt.Fprintln(h)
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("fingerprint unsupported file type: %s", path)
+		}
+		f, err := openForRead(r, filepath.FromSlash(path))
+		if err != nil {
+			return err
+		}
+		opened, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+			return err
+		}
+		if !opened.Mode().IsRegular() {
+			_ = f.Close()
+			return fmt.Errorf("file type changed during fingerprint: %s", path)
+		}
+		contentHash := sha256.New()
+		_, copyErr := io.Copy(contentHash, f)
+		closeErr := f.Close()
+		if copyErr != nil {
+			return copyErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		fmt.Fprintln(h, hex.EncodeToString(contentHash.Sum(nil)))
 		return nil
 	})
-	return hex.EncodeToString(h.Sum(nil))
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func (w *Workspace) Summary() string {

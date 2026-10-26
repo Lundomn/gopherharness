@@ -1,85 +1,162 @@
 # GopherHarness 系统架构
 
-GopherHarness 按职责划分为三个明确的平面：
+GopherHarness 将模型决策和实际执行分开：模型提出工具调用，运行时负责校验、授权、执行、回填结果和保存状态；模型不能直接获得文件系统或进程权限。
+
+## 入口与职责
 
 ```text
-控制平面
-  cmd/gopherharness、cmd/gopherharness-tui
-    -> internal/app
-    -> internal/runtime.Agent
-    -> internal/runtime.run 回合状态机
-    -> provider / protocol / tools / governance
+CLI / TUI -> app -> Agent.Ask
+                       |
+飞书 -> gateway -> scheduler -> runtime.Service -> Agent.Ask
+         |                                |
+         |                        同一套回合状态机
+         |                      /       |        \
+         |                  provider  tools     governance
+         |                              |
+         |                       workspace / sandbox / MCP
+         |
+         +-> Inbox/Outbox Journal -> Delivery -> 平台回复
 
-  cmd/gopherharness-gateway
-    -> gatewayapp -> feishu -> gateway -> scheduler
-    -> runtime.Service -> runtime.Agent
-    -> journal Inbox/Outbox -> delivery -> 平台回复
-
-状态平面
-  session -> working memory -> checkpoint -> todo / plan / worker
-
-证据平面
-  runtime event -> evidence.Recorder -> redactor
-    -> task_state.json / trace.jsonl / session events / report.json
+状态：Session、Working Memory、Checkpoint、Approval、Worker Receipt
+观测：TaskState、Trace、Report、调用成本账本
 ```
 
-## 请求生命周期
+- `app` 解析配置、创建模型和运行时、处理本地交互与关闭。
+- `runtime.Agent` 管理一个会话的回合、上下文、工具反馈循环和终态。
+- `runtime.Service` 管理渠道会话与 Agent 的对应关系；`scheduler` 控制会话顺序、忙时意图及前后台容量。
+- `provider` 适配模型协议、流式响应和重试，不决定工具权限。
+- `tools` 提供工具契约和冻结调用；文件、进程操作经过宿主的窄接口。
+- `gateway` 管理入站去重、执行结果和待投递消息；`Delivery` 发往已确定的回复地址，不重新执行任务。
 
-1. `app.Run` 解析命令行参数、项目配置、环境变量和 provider。
-2. `runtime.New` 校验恢复 checkpoint，并创建 workspace、session、memory、工具注册表、plan、todo、worker、skills、sandbox 和 redactor。
-3. `Agent.Ask` 为主 session 串行化回合。
-4. `run` 创建运行目录，并在调用模型前写入第一份任务状态。
-5. 在安全点取出中途补充消息；`contextbuilder.BuildChecked` 组装稳定指令、工具、skills、workspace、memory、历史记录和当前请求，检查工具关联闭包及最终文本字节上限。
-6. provider 返回 JSON 或 SSE 文本；`protocol.Parse` 将完整响应分类为工具调用、最终回答或重试。TUI 只流式展示最终回答文本。
-7. 每个工具执行前经过 allowlist、plan mode、approval、JSON Schema 参数校验和 handler；文件和进程操作分别进入 workspace、sandbox 边界。仅显式声明安全的只读工具连续段并发，默认四路，写操作形成屏障。
-8. 工具输出加入 transcript；过大的输出转为 run artifact。runtime 同步更新 memory、checkpoint、trace 和 session event。
-9. final readiness 检查变更路径、验证证据和活动 worker，决定是否接受回答。
-10. 接受最终回答后，写入最新 checkpoint、晋升持久事实、关闭任务状态和报告，并可在门控通过后提交后台 dream consolidation。
+## 回合与模型迭代
 
-## 并发模型
+一次 `Ask` 是一个 Turn（用户回合）；回合内可以有多次 Iteration（模型调用与工具反馈）。
 
-主 session 由 mutex 保护，避免两个调用者同时修改 transcript。Service 为不同会话分配独立实例，调度器提供顺序和容量边界。Worker 在独立 session 中运行于 goroutine，拥有步数上限、取消 context 和 inbox channel；不是独立操作系统进程。Dream 由门控、文件锁和 wait group 保护。`Agent.Close` 会取消并等待 worker，再等待记忆维护。
+1. `Ask` 取得可取消的会话锁和进程间 Turn Lease，拒绝与未完成审批冲突的新回合。运行时先保存用户消息与任务初始状态。
+2. 回合开始时读取两路记忆、选择技能、冻结工具目录，筛选历史并组装上下文一次。
+3. 每次模型调用前，在安全点读取补充消息和已完成 Worker 结果，追加上一轮工具结果，刷新本次要公布的工具目录，并检查完整请求预算。不会每轮重新召回记忆、重排整段历史。
+4. 支持原生工具协议的模型通过 `ChatClient` / `ChatStreamClient` 接收角色消息和工具定义。运行时保存工具调用 ID，并用原 ID 回填结果；同协议需要的不透明推理块或签名内容不随意改写。
+5. 仅兼容文本模型走 `Complete` / `Stream` 与 `protocol.Parse`。该路径使用 `<tool>` / `<final>`，不是所有模型的统一内部协议。
+6. 工具批次完成后保存会话、任务状态和检查点；关键持久化失败就停止，不继续调用下一轮模型或工具。
+7. 模型提出最终回答后，由验收策略判断能否结束；通过后提交报告，再通知后台事实写入和可选 Dream（记忆整理）。
 
-会话隔离不等于文件隔离：多会话仍共享工作区。fresh-read 的读取核对与写入不是原子事务，不能代替多进程文件锁或独立工作树。
+默认主回合最多执行 50 个工具步骤、40 次模型调用，两者分别计数。同工具、相同参数和相同错误累计两次会触发无进展保护；成功的重复读取不触发。工具额度耗尽或触发该保护后，不再公布工具，最多允许两次纯文本收尾，仍受总调用次数、成本和取消限制。
 
-渠道关闭先封口、取消并等待调度与投递，最后释放持久日志锁。调用者等待超时后仍保留清理所有者；无法强杀不响应上下文的任意 Go 协程。
+## 上下文：先选择，再增量维护
 
-## 持久化契约
+窗口优先来自模型 Provider 的能力配置，再应用显式覆盖；没有配置时才使用默认窗口 65,536 词元、输出预留 8,192 词元、输入额度 57,344 词元。配置备用模型时还要考虑其窗口和编码能力。额外字节上限默认关闭，不用固定 60,000 字节代替模型窗口。
+
+原生请求的顺序是：
+
+```text
+system：运行规则与工作区摘要 -> 记忆 -> 常驻技能 -> 本轮检索技能 -> 工作状态
+历史：按原顺序排列的完整用户对话组
+user：当前请求
+后续迭代：补充消息、assistant 工具调用、对应 tool 结果
+tools：本次工具定义，作为独立请求字段发送并计入预算
+```
+
+历史按用户消息分组：从一条用户消息开始，连同后面的模型消息和工具调用/结果，直到下一条用户消息。默认保护**开头 6 条消息涉及的完整组**，同时保护最新组和当前请求；不是只保存 6 条消息，也不是固定保护 6 个用户回合。
+
+选择分三条路径：
+
+- 快速路径：历史用量低于剩余历史额度的 60% 阈值，且最终完整请求放得下，直接保留；达到阈值就进入选择路径。
+- Curator（历史筛选器）路径：模型在受限工具循环中读取候选组、选择或评分，必要时生成工作状态；代码校验组 ID、保护范围、工具关联和最终预算，不能由模型评分覆盖硬约束。
+- 规则回退：模型选择失败时按规则选组，并再次检查完整请求；固定材料和受保护内容仍然超限时返回预算错误，不默默删除当前要求。
+
+每次 Iteration 重新计量实际消息与工具定义。原生请求膨胀时，可以省略旧工具输出正文，保留最近 3 条工具结果以及调用 ID 和关联关系；原始结果仍在会话账本中，不重新执行工具。供应商明确返回上下文超限且尚无部分响应时，最多再做两次有界收缩重试。文本兼容路径不假装具备同样的原生消息裁剪能力。
+
+词元计数仍是本地估算，包含协议余量；不保证等于供应商账单计数。详细规则见[上下文预算](CONTEXT_BUDGET.md)。
+
+## 记忆与技能
+
+记忆输入有两路：宿主 `user.md` 的章节背景，以及后端按当前查询召回的结果，最后合并为记忆段。工作状态是独立材料；“笔记和事实各取几条”不是两路输入的含义。后端正常无命中可以为空，硬错误则中止本轮，避免悄悄使用残缺上下文。
+
+事实写入使用持久 Outbox（待办箱）：先准备带 Turn ID 的写入意图，主结果成功保存后才发送给后端；失败可以重试，本地按 Turn ID 去重。内置后端按工作区和用户隔离；通用 HTTP JSON 后端需要遵守其明确协议和幂等键契约，不等于兼容任意外部记忆产品，也不代表存在通用语义冲突消解算法。
+
+技能采用本地 BM25（词项统计排序）路由：名称、描述和正文前 4,000 字符参与索引，参数为 `k1=1.5`、`b=0.75`；常驻最多 5 份，候选最多 5 份，显式激活正文最多 2 份。目录按需检查刷新，重建后原子切换索引快照，并提供显式刷新；不是常驻文件监听服务。渠道 Service 默认关闭个人技能来源。
+
+Dream 使用 Agent 生命周期上下文，保留因果追踪身份，不复用已经结束的 Turn 取消信号；整理材料按用户作用域过滤。完整说明见[记忆与技能](MEMORY_AND_SKILLS.md)。
+
+## 工具、审批和工作区
+
+本次模型请求使用一个工具目录快照。`PrepareContext` 从同一快照冻结工具规格、参数和执行入口；执行前再次核对目录代次。目录变化时返回 `definition_changed`，不会按旧规格批准、再偷偷执行新处理器；已进入旧处理器的调用可以完成。
+
+工具经过参数校验、允许列表、计划模式、文件前置条件和审批。连续、明确标记为只读且可安全并发的工具最多四路执行；遇到写工具先等待前面的读取全部结束，再串行执行。工具超时和取消传给宿主，不能保证强杀任意不响应取消的 Go 协程。
+
+异步审批由宿主显式开启。风险动作冻结后进入 `pending`，保存当前工具批次和调用 ID，释放运行容量；该会话保持暂停，不能让普通新请求越过审批。可信控制面通过批准或拒绝接口恢复原回合：
+
+```text
+pending -> approved / denied / expired
+approved -> claimed -> completed / unknown
+```
+
+领取前可以撤回批准。恢复时核对身份、会话版本、工具规格和文件内容；领取使用持久条件更新，防止重复执行。`claimed` 但没有可靠完成回执的动作按未知结果处理，不在重启后自动重放。已有完成回执可以补回原调用结果，而不再次执行动作。
+
+工作区通过 `os.Root` 约束实际文件访问范围。`ReadSnapshot` 记录实际返回字节的内容哈希；各 Worker 使用独立读取视图，共享规范化路径锁。写入在路径锁内核对最新内容，采用同目录临时文件、同步和替换。检查点指纹包含路径、类型、权限、链接目标及文件内容哈希，读取失败不会当作“文件没变”。这些措施约束协作运行时，不会排斥任意外部编辑器，也不是多文件原子事务。
+
+## 会话调度与后台 Worker
+
+Service 将会话标识、Session ID 和已认证发送方绑定并持久化，重启复用同一会话；不能通过换发送方复用别人的会话。每个会话有顺序 Lane（队列通道），前后台有独立容量。队列硬上限为 128，深度达到 50 发出可观测告警；告警阈值不是硬上限。
+
+`INJECT` 把消息放入会话缓冲区，只在模型迭代安全点取出。它不改写已提交工具的参数、不打断当前工具批次。中断请求和关闭则显式取消并等待实际收束。
+
+Worker 是独立会话的 goroutine，不是独立操作系统进程。默认并发 4、每会话滚动一小时最多接收 30 个任务、收件箱 50 条；子任务最多 50 个工具步骤、15 次模型调用，不能继续创建嵌套 Worker。默认禁止风险写入；显式开启 Worker 写入还要求主策略为 `auto`，不能由模型自行升级权限。
+
+主回合正常结束不取消已经接收的 Worker；显式取消会话和 `Close` 会取消并等待。Worker 的最终结果与待通知记录持久化，回注链路为：
+
+```text
+Worker 完成 -> 持久结果回执
+  -> 主回合安全点 / 下一次 CLI Ask：写入唯一结果消息 -> 保存 Session -> 确认回执
+  -> Service 空闲：后台只做结果总结 -> 保存 Summary Outbox -> 交给渠道持久投递
+```
+
+回注消息使用稳定 Worker ID 去重。空闲总结禁用工具并限制模型次数；投递失败只重发已经保存的总结，不重新调用模型。服务启动后可以仅恢复待投递总结，不必创建 Agent 或新任务。显式取消/关闭撤销未交接通知；已经发生的外部发送不能撤销。投递入队成功不等于用户已读。
+
+## 持久恢复与所有权
+
+几个机制解决不同问题：
+
+| 机制 | 作用 |
+| --- | --- |
+| Agent 会话锁 | 同一实例内串行化回合，等待者可取消 |
+| Turn Lease（回合锁） | 串行化协作进程中的活动回合 |
+| Worker 所有权锁 | 整个生命周期保持，阻止第二个运行时接管仍有后台任务的会话 |
+| Epoch（所有者代次） | 接管后拒绝旧所有者继续保存 |
+| Revision / Content Fence（版本与内容校验） | 保存时识别过期快照和意外内容变化 |
+| Checkpoint（检查点） | 校验运行状态与当前工作区是否仍匹配 |
+
+恢复加载账本、回执和检查点，不复活旧 goroutine、进程或连接。旧 Worker 活动记录只有在成功获得所有权锁后才标记为中断；不会偷走另一个活实例的任务。缺少可靠回执的外部副作用必须对账，不能因为模型重新提出相同动作就自动重做。
+
+主要状态文件：
 
 ```text
 .pico/
   sessions/<session_id>.json
   sessions/<session_id>.events.jsonl
-  runs/<run_id>/task_state.json
-  runs/<run_id>/trace.jsonl
-  runs/<run_id>/report.json
-  runs/<run_id>/checkpoint.json
+  runs/<run_id>/{task_state.json,checkpoint.json,report.json,trace.jsonl}
   runs/<run_id>/artifacts/*
+  service/routes.json
+  approvals/requests.json
+  approvals/continuations/<session_hash>.json
+  workers/<session_hash>.json
+  workers/summaries.json
+  memory/outbox/<scope_hash>.json
   memory/working*.json
-  memory/facts.json
-  memory/topics/project.md
-  memory/topics/dream.md
-  memory/dream-state.json
+  memory/topics/*
+  context-archives/*
   telemetry/<session_id>.calls.jsonl
   gateway/journal.json
-  media/*
-  maintenance/<fix_id>/*
-  todos.json
-  plans/active.md
 ```
 
-运行文件使用受限权限；trace、session event 和 session snapshot 通过配置密钥和模式脱敏。归档、附件与 Journal 可能含用户原文，不能认为所有文件都已脱敏，必须保护整个运行目录。
+关键状态存储使用文件锁、重读、条件更新及临时文件同步替换；会话、检查点、报告等不是一个跨文件事务，靠明确写入顺序、回执与恢复校验处理已覆盖的崩溃窗口。追踪事件写入可能失败，丢失计数可观测，不能把所有 Trace 都视为可靠事务日志。
 
-事实和收发日志使用带进程锁、重读、临时文件、同步与替换的文件事务；普通会话快照、检查点和报告不是一个跨文件事务。Journal 重启只自动重排明确未启动的工作，运行中/发送中状态转为需对账/未知，不盲目重放副作用。
+运行目录使用受限权限，并对配置密钥和已知模式脱敏；这不是通用隐私识别器。附件、归档和收发日志仍可能包含用户原文，需要保护整个运行目录。
 
-## Go 设计选择
+## 验收、成本与链路追踪
 
-- `context.Context` 统一管理取消和 Shell/模型超时。
-- 使用接口隔离 provider 与工具宿主，便于无网络测试。
-- 使用 goroutine 和 channel 实现隔离的后台 worker。
-- 使用具体 Go struct 承载数据契约，在 registry 和边界方法执行校验。
-- 并发和业务状态主要使用标准库；MCP 与飞书使用各自官方 Go SDK，参数约束使用 `jsonschema-go`。
+验收策略检查变更路径、验证证据及活动 Worker。Shell 验证依据宿主返回的 `shell_completed` 和 `shell_exit_code`，还要求命令本身是可识别的顶层测试、构建或静态检查；不从标准输出中的 `exit_code: 0` 猜测成功。通过一条检查不等于证明覆盖完整或代码语义正确。
 
-上下文是字节预算，不是精确 token 计量；工作区恢复指纹当前为路径、大小和修改时间；词法召回不是向量检索；调用账本不等于自动节费。平台入口默认只开放可信白名单用户的读取能力，不是公开匿名 Agent 服务。
+成本按实际调用 Attempt（尝试）记账，主回合、子任务和内部模型调用共享预算；账本本身不代表自动节费。Trace ID、父子 Span 身份显式通过 `context` 和队列传递，后台任务保留因果身份但使用自己的生命周期。执行完成、审批结果未知、投递成功是不同终态，不合并成一个“成功”。
 
-完整请求链路和扩展规则见[请求链路文档](REQUEST_FLOW.md)、[飞书部署](FEISHU.md)及[能力状态](GO_REWRITE_STATUS.md)。
+飞书入口默认仅允许可信白名单用户读取文件、目录和搜索；扩大工具范围需要宿主显式允许列表和真实审批，远程 `auto` 禁止。部署与边界见[飞书说明](FEISHU.md)，逐步调用顺序见[请求链路](REQUEST_FLOW.md)，能力状态见[Go 能力状态](GO_REWRITE_STATUS.md)。

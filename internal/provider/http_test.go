@@ -95,10 +95,10 @@ func TestStreamingClients(t *testing.T) {
 	t.Run("openai", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprintln(w, `data: {"type":"response.output_text.delta","delta":"<final>hel"}`)
-			fmt.Fprintln(w, `data: {"type":"response.output_text.delta","delta":"lo</final>"}`)
-			fmt.Fprintln(w, `data: {"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}`)
-			fmt.Fprintln(w, `data: [DONE]`)
+			fmt.Fprintf(w, "%s\n\n", `data: {"type":"response.output_text.delta","delta":"<final>hel"}`)
+			fmt.Fprintf(w, "%s\n\n", `data: {"type":"response.output_text.delta","delta":"lo</final>"}`)
+			fmt.Fprintf(w, "%s\n\n", `data: {"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}}`)
+			fmt.Fprintf(w, "%s\n\n", `data: [DONE]`)
 		}))
 		defer srv.Close()
 		client := NewOpenAI(config.Provider{Name: "openai", APIKey: "key", BaseURL: srv.URL, Model: "m"}, 10).(StreamClient)
@@ -111,9 +111,10 @@ func TestStreamingClients(t *testing.T) {
 	t.Run("anthropic", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprintln(w, `data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}`)
-			fmt.Fprintln(w, `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"<final>ok</final>"}}`)
-			fmt.Fprintln(w, `data: {"type":"message_delta","usage":{"output_tokens":2}}`)
+			fmt.Fprintf(w, "%s\n\n", `data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}`)
+			fmt.Fprintf(w, "%s\n\n", `data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"<final>ok</final>"}}`)
+			fmt.Fprintf(w, "%s\n\n", `data: {"type":"message_delta","usage":{"output_tokens":2}}`)
+			fmt.Fprintf(w, "%s\n\n", `data: {"type":"message_stop"}`)
 		}))
 		defer srv.Close()
 		client := NewAnthropic(config.Provider{Name: "anthropic", APIKey: "key", BaseURL: srv.URL, Model: "m"}, 10).(StreamClient)

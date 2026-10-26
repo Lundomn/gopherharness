@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net"
+	"strings"
 	"time"
 )
 
@@ -18,6 +19,11 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string { return fmt.Sprintf("provider HTTP %d: %s", e.Status, e.Detail) }
 func Retryable(err error) bool {
+	for _, fatal := range []error{ErrBudgetExhausted, ErrBudgetAccounting, ErrBudgetState, ErrNestedBudget} {
+		if errors.Is(err, fatal) {
+			return false
+		}
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
@@ -28,7 +34,25 @@ func Retryable(err error) bool {
 	var n net.Error
 	return errors.As(err, &n) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }
-func ContextOverflow(err error) bool { var h *HTTPError; return errors.As(err, &h) && h.Status == 413 }
+func ContextOverflow(err error) bool {
+	var h *HTTPError
+	if !errors.As(err, &h) {
+		return false
+	}
+	if h.Status == 413 {
+		return true
+	}
+	if h.Status != 400 {
+		return false
+	}
+	detail := strings.ToLower(h.Detail)
+	for _, code := range []string{"context_length_exceeded", "maximum context length", "prompt is too long", "exceeds the context window", "input length and max_tokens exceed"} {
+		if strings.Contains(detail, code) {
+			return true
+		}
+	}
+	return false
+}
 
 type requestKey struct{}
 
@@ -51,6 +75,9 @@ type Resilient struct {
 func (r *Resilient) Name() string  { return r.Clients[0].Name() }
 func (r *Resilient) Model() string { return r.Clients[0].Model() }
 func (r *Resilient) call(ctx context.Context, run func(Client) (Completion, error)) (Completion, error) {
+	if len(r.Clients) == 0 {
+		return Completion{}, fmt.Errorf("no provider clients configured")
+	}
 	var out Completion
 	var err error
 	for _, c := range r.Clients {

@@ -6,10 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Lundomn/gopherharness/internal/journal"
 	"sync"
 	"time"
 
+	"github.com/Lundomn/gopherharness/internal/journal"
 	"github.com/Lundomn/gopherharness/internal/scheduler"
 	"github.com/Lundomn/gopherharness/internal/tracing"
 )
@@ -26,6 +26,16 @@ type Outlet interface {
 }
 type IdempotentOutlet interface{ Idempotent() bool }
 type TerminalError struct{ Err error }
+
+// RejectedError means a definitive rejection before delivery, not a lost reply
+// after a possible send. Only these errors or an explicitly idempotent outlet
+// may be retried; a generic network error has an unknown external outcome.
+type RejectedError struct{ Err error }
+
+func (e RejectedError) Error() string { return e.Err.Error() }
+func (e RejectedError) Unwrap() error { return e.Err }
+
+type uncertainError struct{ error }
 
 func (e TerminalError) Error() string { return e.Err.Error() }
 func (e TerminalError) Unwrap() error { return e.Err }
@@ -174,18 +184,27 @@ func (h *Hub) send(outlet Outlet, msg Message) {
 	}
 	for attempt := 0; attempt <= h.retries; attempt++ {
 		ctx, cancel := context.WithTimeout(tracing.Attach(h.ctx, msg.Identity), h.timeout)
-		receipt, err := outlet.Send(ctx, msg)
+		receipt, err := guardedSend(ctx, outlet, msg)
 		cancel()
 		record.Attempts++
+		if err == nil && receipt.MessageID == "" {
+			err = errors.New("delivery returned no platform receipt")
+		}
 		if err == nil {
 			record.Receipt = receipt
 			record.Outcome = "delivered"
 			break
 		}
 		var terminal TerminalError
-		if h.Journal != nil && msg.ID != "" && !errors.As(err, &terminal) {
+		var uncertain uncertainError
+		if errors.As(err, &uncertain) {
+			record.Outcome = "unknown"
+			break
+		}
+		var rejected RejectedError
+		if !errors.As(err, &terminal) && !errors.As(err, &rejected) {
 			idem, ok := outlet.(IdempotentOutlet)
-			if !ok || !idem.Idempotent() {
+			if !ok || !idem.Idempotent() || msg.ID == "" {
 				record.Outcome = "unknown"
 				break
 			}
@@ -211,6 +230,15 @@ func (h *Hub) send(outlet Outlet, msg Message) {
 	if h.sink != nil && (h.Journal == nil || msg.ID == "") {
 		h.sink(record)
 	}
+}
+
+func guardedSend(ctx context.Context, outlet Outlet, msg Message) (receipt Receipt, err error) {
+	defer func() {
+		if value := recover(); value != nil {
+			err = uncertainError{fmt.Errorf("delivery adapter panic: %v; external outcome requires reconciliation", value)}
+		}
+	}()
+	return outlet.Send(ctx, msg)
 }
 
 // Close seals admission and attempts to drain accepted messages before cancelling
