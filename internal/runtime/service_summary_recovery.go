@@ -53,7 +53,8 @@ func (s *Service) replayDetachedSummaries() {
 	if json.Unmarshal(data, &state) != nil {
 		return
 	}
-	data, err = os.ReadFile(filepath.Join(root, ".pico", "service", "routes.json"))
+	routeFile := durable.File[serviceRoutes]{Path: filepath.Join(root, ".pico", "service", "routes.json")}
+	data, err = os.ReadFile(routeFile.Path)
 	if err != nil {
 		return
 	}
@@ -68,11 +69,7 @@ func (s *Service) replayDetachedSummaries() {
 		if loaded[r.Summary.Conversation] || (r.Status != "pending" && r.Status != "generating") {
 			continue
 		}
-		route, ok := routes.Routes[r.Summary.Conversation]
-		if !ok || route.Session != r.Summary.SessionID || route.Source != r.Summary.Source || id != r.Summary.RunID || id == "" || filepath.Base(id) != id || strings.ContainsAny(id, `/\`) {
-			continue
-		}
-		if route.Source.Channel != "" && (route.Source.ChatID == "" || route.Source.SenderID == "") {
+		if !detachedSummaryMatchesRoute(id, r, routes) {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(s.workerCtx, 10*time.Second)
@@ -87,14 +84,28 @@ func (s *Service) replayDetachedSummaries() {
 			r = current.Records[id]
 		}
 		if e == nil && (r.Status == "pending" || r.Status == "generating") {
-			r, e = recoverSummary(ctx, root, r)
-			if e == nil {
-				if e = sink(ctx, r.Summary); e == nil {
-					_ = settleSummary(ctx, root, id, "accepted", "")
+			// The inventory and route read above can become stale while another
+			// summary is sent or this delivery lease is acquired. Re-attest the
+			// freshly loaded receipt against the current route before any handoff.
+			currentRoutes, routeErr := routeFile.Read(ctx)
+			if routeErr == nil && detachedSummaryMatchesRoute(id, r, currentRoutes) {
+				r, e = recoverSummary(ctx, root, r)
+				if e == nil {
+					if e = sink(ctx, r.Summary); e == nil {
+						_ = settleSummary(ctx, root, id, "accepted", "")
+					}
 				}
 			}
 		}
 		release()
 		cancel()
 	}
+}
+
+func detachedSummaryMatchesRoute(id string, r summaryReceipt, routes serviceRoutes) bool {
+	route, ok := routes.Routes[r.Summary.Conversation]
+	if !ok || route.Session != r.Summary.SessionID || route.Source != r.Summary.Source || id != r.Summary.RunID || id == "" || filepath.Base(id) != id || strings.ContainsAny(id, `/\`) {
+		return false
+	}
+	return route.Source.Channel == "" || (route.Source.ChatID != "" && route.Source.SenderID != "")
 }
