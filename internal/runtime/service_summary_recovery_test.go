@@ -3,11 +3,69 @@ package runtime
 import (
 	"context"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 
 	"github.com/Lundomn/gopherharness/internal/durable"
+	"github.com/Lundomn/gopherharness/internal/model"
+	"github.com/Lundomn/gopherharness/internal/redact"
 	"github.com/Lundomn/gopherharness/internal/scheduler"
+	"github.com/Lundomn/gopherharness/internal/workspace"
 )
+
+func TestLoadedSummaryDispatchWaitsForDetachedHandoff(t *testing.T) {
+	root := t.TempDir()
+	synctest.Test(t, func(t *testing.T) {
+		ctx := context.Background()
+		source := scheduler.Source{Channel: "test", ChatID: "group", SenderID: "alice"}
+		if err := (durable.File[serviceRoutes]{Path: filepath.Join(root, ".pico", "service", "routes.json")}).Update(ctx, func(v *serviceRoutes) error {
+			v.Routes = map[string]serviceRoute{"conversation": {Session: "session", Source: source}}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := saveSummary(ctx, root, summaryReceipt{Status: "pending", Summary: WorkerSummary{Conversation: "conversation", SessionID: "session", RunID: "run", Source: source, Text: "saved result"}}); err != nil {
+			t.Fatal(err)
+		}
+		entered, release := make(chan struct{}), make(chan struct{})
+		var sends atomic.Int32
+		s := &Service{opts: Options{Root: root}, workerCtx: ctx, agents: map[string]*Agent{}, owners: map[string]scheduler.Source{}, workerNotifications: map[string]*workerNotification{}}
+		s.workerSink = func(context.Context, WorkerSummary) error {
+			if sends.Add(1) == 1 {
+				close(entered)
+				<-release
+			}
+			return nil
+		}
+		detachedDone := make(chan struct{})
+		go func() { defer close(detachedDone); s.replayDetachedSummaries() }()
+		<-entered
+		// The startup pass took its inventory before the foreground request
+		// loaded this Agent. Both paths now see the same pending summary.
+		s.mu.Lock()
+		s.agents["conversation"] = &Agent{Session: &model.Session{ID: "session"}, Workspace: &workspace.Workspace{Root: root}, Redactor: redact.New()}
+		s.owners["conversation"] = source
+		s.workerNotifications["conversation"] = &workerNotification{scheduled: true}
+		s.mu.Unlock()
+		loadedDone := make(chan struct{})
+		go func() { defer close(loadedDone); s.dispatchWorkerSummary("conversation") }()
+		synctest.Wait()
+		if got := sends.Load(); got != 1 {
+			t.Errorf("loaded path overlapped an in-progress detached handoff: sends=%d", got)
+		}
+		close(release)
+		<-detachedDone
+		<-loadedDone
+		if got := sends.Load(); got != 1 {
+			t.Errorf("already accepted summary was dispatched again: sends=%d", got)
+		}
+		state, err := summaryFile(root).Read(ctx)
+		if err != nil || state.Records["run"].Status != "accepted" {
+			t.Fatalf("summary status not settled: %+v, err=%v", state, err)
+		}
+	})
+}
 
 func TestDetachedSummaryRevalidatesCurrentReceiptAndRoute(t *testing.T) {
 	for _, change := range []string{"summary_sender", "route_sender", "run_id", "valid_text"} {

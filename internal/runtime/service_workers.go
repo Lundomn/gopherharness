@@ -144,7 +144,23 @@ func (s *Service) dispatchWorkerSummary(cid string) {
 			return
 		}
 	}
-	if r.Summary.SessionID != a.SessionID() || r.Summary.Source != source {
+	id := r.Summary.RunID
+	release, err := summaryDeliveryLease(ctx, a.Workspace.Root, id)
+	if err != nil {
+		return
+	}
+	defer release()
+	// A detached startup pass may have accepted this summary after nextSummary
+	// returned. Only the fresh record under the shared delivery lease can admit
+	// another handoff; do not send the earlier inventory snapshot.
+	current, err := summaryFile(a.Workspace.Root).Read(ctx)
+	if err != nil {
+		return
+	}
+	r, found = current.Records[id]
+	if !found || r.Summary.RunID != id || r.Summary.Conversation != cid ||
+		(r.Status != "pending" && r.Status != "generating") ||
+		r.Summary.SessionID != a.SessionID() || r.Summary.Source != source {
 		return
 	}
 	r, err = recoverSummary(ctx, a.Workspace.Root, r)

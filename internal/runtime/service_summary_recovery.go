@@ -2,8 +2,6 @@ package runtime
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -73,8 +71,7 @@ func (s *Service) replayDetachedSummaries() {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(s.workerCtx, 10*time.Second)
-		hash := sha256.Sum256([]byte(id))
-		release, e := durable.Lease(ctx, filepath.Join(root, ".pico", "workers", "delivery-locks", hex.EncodeToString(hash[:])+".lock"))
+		release, e := summaryDeliveryLease(ctx, root, id)
 		if e != nil {
 			cancel()
 			continue

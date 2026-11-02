@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -24,6 +26,13 @@ type summaryReceipt struct {
 	LastError string
 }
 type summaryReceipts struct{ Records map[string]summaryReceipt }
+
+// Both live and startup delivery must own the same summary lease before
+// rereading its status and handing its saved text to a channel adapter.
+func summaryDeliveryLease(ctx context.Context, root, id string) (func(), error) {
+	hash := sha256.Sum256([]byte(id))
+	return durable.Lease(ctx, filepath.Join(root, ".pico", "workers", "delivery-locks", hex.EncodeToString(hash[:])+".lock"))
+}
 
 func summaryFile(root string) durable.File[summaryReceipts] {
 	return durable.File[summaryReceipts]{Path: filepath.Join(root, ".pico", "workers", "summaries.json")}
