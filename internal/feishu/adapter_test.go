@@ -127,7 +127,7 @@ func TestDeliveryUsesStableIDAndClassifiesHTTPFailures(t *testing.T) {
 	}))
 	defer api.Close()
 	a := adapterForTest(t, api.URL, func(gateway.Event) error { return nil })
-	m := delivery.Message{ID: "stable-id", Source: scheduler.Source{ChatID: "chat"}, Text: "hello"}
+	m := delivery.Message{ID: "stable-id", Source: scheduler.Source{Channel: "feishu", ChatID: "chat", SenderID: "allowed"}, Text: "hello"}
 	for i := 0; i < 2; i++ {
 		if _, err := a.Send(context.Background(), m); err != nil {
 			t.Fatal(err)

@@ -350,6 +350,11 @@ func (a *Adapter) download(ctx context.Context, id, key, kind string) (string, e
 }
 func (a *Adapter) Idempotent() bool { return true }
 func (a *Adapter) Send(ctx context.Context, m delivery.Message) (delivery.Receipt, error) {
+	// Pending replies can outlive the configuration that admitted their task.
+	// Check at the final boundary too, including journal replay and retries.
+	if !a.Allowed(m.Source) {
+		return delivery.Receipt{}, delivery.TerminalError{Err: errors.New("reply owner or chat is no longer allowed")}
+	}
 	if m.Source.ChatID == "" {
 		return delivery.Receipt{}, delivery.TerminalError{Err: errors.New("reply target missing")}
 	}
