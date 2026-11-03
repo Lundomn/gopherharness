@@ -92,6 +92,8 @@ type Journal struct {
 	File      durable.File[State]
 	epoch     uint64
 	release   func()
+	ownerMu   sync.RWMutex
+	closed    bool
 	closeOnce sync.Once
 }
 
@@ -129,6 +131,11 @@ func Open(ctx context.Context, root string) (*Journal, error) {
 	return j, nil
 }
 func (j *Journal) mutate(ctx context.Context, fn func(*State) error) error {
+	j.ownerMu.RLock()
+	defer j.ownerMu.RUnlock()
+	if j.closed {
+		return ErrFence
+	}
 	return j.File.Update(ctx, func(s *State) error {
 		if s.Epoch != j.epoch {
 			return ErrFence
@@ -226,6 +233,11 @@ func (j *Journal) List(ctx context.Context, kind, state string) ([]Entry, error)
 }
 func (j *Journal) Close() {
 	j.closeOnce.Do(func() {
+		// Finish an admitted mutation before releasing ownership, and retire
+		// this object even if no successor has incremented the durable epoch.
+		j.ownerMu.Lock()
+		defer j.ownerMu.Unlock()
+		j.closed = true
 		if j.release != nil {
 			j.release()
 		}
