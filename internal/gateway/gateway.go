@@ -207,6 +207,9 @@ func (g *Gateway) Replay(ctx context.Context) error {
 		if err = json.Unmarshal(e.Payload, &m); err != nil {
 			return err
 		}
+		if m.ID != e.ID {
+			return errors.New("outbound journal identity mismatch")
+		}
 		if err = g.Hub.Post(ctx, m); err != nil {
 			return err
 		}
@@ -219,6 +222,9 @@ func (g *Gateway) Replay(ctx context.Context) error {
 		var event Event
 		if err = json.Unmarshal(e.Payload, &event); err != nil {
 			return err
+		}
+		if event.Request.Source.Channel+":"+event.ID != e.ID {
+			return errors.New("inbound journal identity mismatch")
 		}
 		// Publish accepts a fresh receipt; remove no records. Requeue through a
 		// dedicated claim path by marking the existing record ready for retry.

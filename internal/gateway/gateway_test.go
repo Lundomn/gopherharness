@@ -107,6 +107,71 @@ func TestReconcileRecoveredTextKeepsTrustedRoute(t *testing.T) {
 		t.Fatal(m)
 	}
 }
+
+func TestReplayRejectsMismatchedJournalIdentity(t *testing.T) {
+	for _, kind := range []string{"outbox", "inbox"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			t.Cleanup(cancel)
+			j, err := journal.Open(ctx, t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(j.Close)
+			var runs atomic.Int32
+			s := scheduler.New(func(context.Context, scheduler.Request, func() []scheduler.Request) (string, error) {
+				runs.Add(1)
+				return "computed", nil
+			}, 1, 1, 4)
+			hub := delivery.New(4, 0, 0, time.Second, nil)
+			hub.Journal = j
+			messages := make(chan delivery.Message, 4)
+			if err := hub.Register("test", fakeOutlet{messages}); err != nil {
+				t.Fatal(err)
+			}
+			g := New(s, hub, func(scheduler.Source) bool { return true }, nil)
+			g.Journal = j
+			t.Cleanup(func() {
+				if err := g.Close(ctx); err != nil {
+					t.Error(err)
+				}
+			})
+			source := scheduler.Source{Channel: "test", ChatID: "trusted-chat", SenderID: "owner"}
+			if kind == "outbox" {
+				// A damaged envelope must not claim another pending record and
+				// deliver its text to a different, otherwise valid destination.
+				changed := delivery.Message{ID: "test:other", Source: source, Text: "wrong result"}
+				changed.Source.ChatID = "other-chat"
+				if _, err := j.Put(ctx, kind, "test:stored", changed); err != nil {
+					t.Fatal(err)
+				}
+				original := delivery.Message{ID: "test:other", Source: source, Text: "original result"}
+				if _, err := j.Put(ctx, kind, original.ID, original); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				event := Event{ID: "rekeyed", Request: scheduler.Request{Text: "must not rerun", Source: source}}
+				if _, err := j.Put(ctx, kind, "test:stored", event); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := g.Replay(ctx); err == nil {
+				t.Error("replay accepted a payload belonging to another journal identity")
+			}
+			if err := g.Close(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if runs.Load() != 0 || len(messages) != 0 {
+				t.Errorf("mismatched replay dispatched runs=%d replies=%d", runs.Load(), len(messages))
+			}
+			entry, ok, err := j.Get(ctx, kind, "test:stored")
+			if err != nil || !ok || entry.State != "pending" {
+				t.Errorf("rejected entry changed: %+v %v", entry, err)
+			}
+		})
+	}
+}
+
 func TestIngressDedupAndReplyCoordinates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
